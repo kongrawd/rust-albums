@@ -8,10 +8,11 @@
 //!
 //! Generating is safe when two processes start at once (e.g. two containers on
 //! one state volume): the key is created with `create_new`, so exactly one
-//! process writes a pair; the certificate is written to a temporary file and
-//! renamed into place, so it is never read half-written; the other process
-//! waits briefly and loads the pair that was written. A failed write removes
-//! what it wrote, so the next start can generate again.
+//! process writes a pair; the certificate is written atomically, so it is never
+//! read half-written; the other process waits briefly and loads the pair that
+//! was written. Both files are fsynced together with their folder, so they
+//! survive a power cut. A failed write removes what it wrote, so the next start
+//! can generate again.
 
 use crate::config::{self, TlsVersion};
 use crate::crypto;
@@ -147,19 +148,10 @@ fn create_self_signed(settings: &config::Tls) -> Result<Generation, String> {
         }
         Err(err) => return Err(write_error(&settings.key, err)),
     }
-    // Written beside the target and renamed into place, so it is never read half-written.
-    let temporary = settings
-        .cert
-        .with_extension(format!("pem.tmp-{}", std::process::id()));
-    let written = settings
-        .cert
-        .parent()
-        .map_or(Ok(()), fs::create_dir_all)
-        .and_then(|()| fs::write(&temporary, generated.cert.pem()))
-        .and_then(|()| fs::rename(&temporary, &settings.cert));
-    if let Err(err) = written {
+    // Written atomically, so it is never read half-written.
+    if let Err(err) = crypto::write_file_atomically(&settings.cert, generated.cert.pem().as_bytes())
+    {
         // Undo, so the next start can generate again instead of finding a lone key.
-        let _ = fs::remove_file(&temporary);
         let _ = fs::remove_file(&settings.key);
         return Err(write_error(&settings.cert, err));
     }
