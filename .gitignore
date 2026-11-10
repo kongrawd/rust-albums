@@ -1,0 +1,19 @@
+# Cargo build output (debug and release binaries, incremental caches).
+target/
+
+# TLS certificate and private key. Generated self-signed on first run, or your
+# own PEM files. The key is a secret: never commit it.
+certs/
+
+# Local config, created from albums.default.toml on first run and edited per
+# machine. Commit changes to defaults in albums.default.toml instead.
+albums.toml
+
+# Key for album and item link ids, created on first run. A secret: never commit it.
+link.key
+
+# Compose settings with credentials (copy of .env.example).
+.env
+
+# codegraph code-intelligence index (rebuild with `codegraph index`).
+.codegraph/

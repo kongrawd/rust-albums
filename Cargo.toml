@@ -1,0 +1,42 @@
+[package]
+name = "rust-albums"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+
+[dependencies]
+# Web stack
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio", "form", "query"] }
+axum-server = { version = "0.9", features = ["tls-rustls-no-provider"] }
+# Cookie and Basic-auth header parsing.
+axum-extra = { version = "0.12", default-features = false, features = ["cookie", "typed-header"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "time"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tower-http = { version = "0.7", default-features = false, features = ["fs", "set-header"] }
+maud = { version = "0.27", features = ["axum"] }
+
+# TLS: rustls with the `ring` provider. No OpenSSL and no CMake (unlike aws-lc);
+# ring needs only a C compiler for the target, e.g. cargo-zigbuild when cross-compiling.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+ring = "0.17"
+
+# Auth / storage / misc
+base64 = "0.22"
+subtle = "2"
+walkdir = "2"
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
+percent-encoding = "2"
+unicode-normalization = "0.1"
+serde = { version = "1", features = ["derive"] }
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
