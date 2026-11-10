@@ -31,9 +31,6 @@ const ID_BYTES: usize = 16;
 /// Version 1 of the id construction; a new version changes every id.
 const ALBUM_LABEL: &[u8] = b"rust-albums/v1/album\0";
 const ITEM_LABEL: &[u8] = b"rust-albums/v1/item\0";
-/// How long to wait for a key another process is writing at the same moment.
-const CONCURRENT_CREATE_WAIT: Duration = Duration::from_millis(200);
-
 #[derive(Clone)]
 pub struct LinkIds {
     key: hmac::Key,
@@ -44,30 +41,34 @@ impl LinkIds {
     /// exist. Creation never replaces an existing file, so when two processes
     /// start together both end up with the same key.
     pub fn load_or_create(path: &Path) -> Result<Self, String> {
+        Self::load_or_create_waiting(path, crypto::CONCURRENT_CREATION_WAIT)
+    }
+
+    /// [`Self::load_or_create`], waiting up to `wait` for a key another
+    /// process is creating at the same moment.
+    fn load_or_create_waiting(path: &Path, wait: Duration) -> Result<Self, String> {
         let describe = |err: &dyn Display| format!("link key {}: {err}", path.display());
-        match crypto::create_secret_file(path, &crypto::random::<KEY_BYTES>()) {
-            Ok(()) => println!("generated link key -> {}", path.display()),
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+        let wait = match crypto::create_secret_file(path, &crypto::random::<KEY_BYTES>()) {
+            Ok(()) => {
+                println!("generated link key -> {}", path.display());
+                Duration::ZERO
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => wait,
             Err(err) => return Err(describe(&err)),
-        }
-        let mut key = fs::read(path).map_err(|e| describe(&e))?;
-        if key.is_empty() {
-            // Possibly another process created the file and is still writing it.
-            std::thread::sleep(CONCURRENT_CREATE_WAIT);
-            key = fs::read(path).map_err(|e| describe(&e))?;
-        }
-        if key.is_empty() {
-            return Err(describe(
-                &"file is empty, probably from an interrupted first start; delete it to \
-                  generate a new key (all album and item URLs will change)",
-            ));
-        }
-        if key.len() != KEY_BYTES {
-            return Err(describe(&format!(
-                "expected {KEY_BYTES} bytes, found {}",
-                key.len()
-            )));
-        }
+        };
+        let key = crypto::load_when_ready(wait, || {
+            let key = fs::read(path).map_err(|e| describe(&e))?;
+            match key.len() {
+                KEY_BYTES => Ok(key),
+                0 => Err(describe(
+                    &"file is empty, probably from an interrupted first start; delete it to \
+                      generate a new key (all album and item URLs will change)",
+                )),
+                other => Err(describe(&format!(
+                    "expected {KEY_BYTES} bytes, found {other}"
+                ))),
+            }
+        })?;
         warn_if_readable_by_others(path);
         Ok(Self {
             key: hmac::Key::new(hmac::HMAC_SHA256, &key),
@@ -170,13 +171,17 @@ mod tests {
 
         // A wrong-sized key is refused, never silently replaced.
         fs::write(&key_path, b"too short").unwrap();
-        let error = LinkIds::load_or_create(&key_path).err().unwrap();
+        let error = LinkIds::load_or_create_waiting(&key_path, Duration::ZERO)
+            .err()
+            .unwrap();
         assert!(error.contains("expected 32 bytes"), "{error}");
         assert_eq!(fs::read(&key_path).unwrap(), b"too short");
 
         // An empty key (interrupted first start) gets an actionable message.
         fs::write(&key_path, b"").unwrap();
-        let error = LinkIds::load_or_create(&key_path).err().unwrap();
+        let error = LinkIds::load_or_create_waiting(&key_path, Duration::ZERO)
+            .err()
+            .unwrap();
         assert!(error.contains("delete it"), "{error}");
     }
 
