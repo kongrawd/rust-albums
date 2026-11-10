@@ -1,0 +1,59 @@
+# rust-albums configuration.
+#
+# The server copies this file to ./albums.toml (or $ALBUMS_CONFIG) on first run;
+# edit that local copy. Relative paths, here and in the ALBUMS_* overrides below,
+# are resolved against the config file's folder.
+# Secrets are never stored here: set AUTH_USER and AUTH_PASS in the environment.
+# In containers, ALBUMS_BIND_ADDR, ALBUMS_STORAGE_ROOT, ALBUMS_TLS_CERT, ALBUMS_TLS_KEY
+# and ALBUMS_TLS_NAMES override the matching settings below (see README).
+
+[server]
+# The only listener, and it is HTTPS. There is deliberately no plain-HTTP port.
+# Use "0.0.0.0:8443" to serve your local network (the container image does).
+bind_addr = "127.0.0.1:8443"
+
+[storage]
+# Where albums are stored. "local" = a folder on this machine (the only backend).
+backend = "local"
+root = "./storage"
+# Folder layout below `root`; each {placeholder} becomes metadata.
+# Examples: "{album_name}/{file_name}", "year={year}/{album_name}/{seq}_{file_name}"
+pattern = "{album_name}/{file_name}"
+# A file that must exist in `root`. It tells a mounted root apart from an empty
+# folder (e.g. a Docker volume that wasn't mounted, or an unplugged disk). Create it
+# once: `touch <root>/.albums-root`.
+marker = ".albums-root"
+# How often the root is scanned in the background. Raise it for network
+# shares (NFS/SMB) and Docker Desktop bind mounts, where directory walks are slow.
+rescan_secs = 30
+# Files modified more recently than this are skipped until a later scan, so files
+# that are still being copied in are not listed half-written.
+settle_secs = 30
+# File and folder names skipped anywhere below `root` (NAS and OS housekeeping).
+# Names starting with "." are always skipped.
+ignore = ["@eaDir", "#recycle", "$RECYCLE.BIN", "System Volume Information", "lost+found"]
+# Key for album and item link ids: fixed-length, URL-safe ids that stay the same
+# across restarts and pattern edits. Created on first run (mode 0600). Back it up
+# with this file: a new key gives every album and item a new URL.
+link_key = "./link.key"
+
+[tls]
+# PEM certificate chain and private key, e.g. mounted from certbot, Traefik or a
+# Kubernetes secret. If both are missing, a self-signed pair is generated for
+# `self_signed_names`; if only one is missing, startup fails rather than replace it.
+# Restart the server after a renewal.
+cert = "./certs/cert.pem"
+key = "./certs/key.pem"
+self_signed_names = ["localhost", "127.0.0.1"]
+# Oldest TLS version accepted: "1.3" (strict) or "1.2" (for older clients).
+min_version = "1.3"
+# Strict-Transport-Security max-age: browsers refuse plain HTTP to this host for
+# this long. 31536000 = 1 year; 0 disables the header.
+hsts_max_age_secs = 31536000
+
+[session]
+# Browser sessions are kept in memory on the server; restarting signs everyone out.
+# A session ends after this much inactivity (30 min)...
+idle_timeout_secs = 1800
+# ...and at the latest this long after signing in, however active (12 h).
+max_lifetime_secs = 43200

@@ -2,5 +2,6 @@
 
 mod pattern;
 mod crypto;
+mod config;
 
 fn main() {}
