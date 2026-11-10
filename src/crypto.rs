@@ -29,15 +29,20 @@ pub fn random<const N: usize>() -> [u8; N] {
     bytes
 }
 
-/// Writes a file readable only by the owner (mode 0600 on unix), creating its folder.
-pub fn write_secret_file(path: &Path, data: &[u8]) -> io::Result<()> {
+/// Creates a file readable only by the owner (mode 0600 on unix), creating its
+/// folder. Fails with `AlreadyExists` instead of replacing an existing file, so
+/// two processes starting at once can't overwrite each other's secret. The data
+/// is flushed to disk before returning.
+pub fn create_secret_file(path: &Path, data: &[u8]) -> io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    options.open(path)?.write_all(data)
+    let mut file = options.open(path)?;
+    file.write_all(data)?;
+    file.sync_all()
 }

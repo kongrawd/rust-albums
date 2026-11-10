@@ -3,5 +3,6 @@
 mod pattern;
 mod crypto;
 mod config;
+mod link_ids;
 
 fn main() {}
