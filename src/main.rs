@@ -7,5 +7,6 @@ mod link_ids;
 mod library;
 mod tls;
 mod session;
+mod routes;
 
 fn main() {}
