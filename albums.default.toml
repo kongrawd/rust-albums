@@ -29,8 +29,8 @@ rescan_secs = 30
 # Files modified more recently than this are skipped until a later scan, so files
 # that are still being copied in are not listed half-written.
 settle_secs = 30
-# File and folder names skipped anywhere below `root` (NAS and OS housekeeping).
-# Names starting with "." are always skipped.
+# File and folder names skipped anywhere below `root` (NAS and OS housekeeping),
+# matched case-insensitively. Names starting with "." are always skipped.
 ignore = ["@eaDir", "#recycle", "$RECYCLE.BIN", "System Volume Information", "lost+found"]
 # Key for album and item link ids: fixed-length, URL-safe ids that stay the same
 # across restarts and pattern edits. Created on first run (mode 0600). Back it up
