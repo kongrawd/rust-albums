@@ -1,0 +1,33 @@
+# Format, lint and test on every pull request and on main.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Format, lint and test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The minimum supported Rust version (Cargo.toml `rust-version`), on
+      # purpose: the image may build with a newer one as Dependabot bumps it.
+      - name: Rust 1.90
+        run: |
+          rustup toolchain install 1.90 --profile minimal --component rustfmt,clippy
+          rustup default 1.90
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked

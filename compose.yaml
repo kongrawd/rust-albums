@@ -1,0 +1,49 @@
+# rust-albums with Docker Compose. Setup: the README quick start; details:
+# docs/docker.md.
+#
+# Photos are mounted read-only and never written. Everything the server writes
+# (config, self-signed certificate, link key) goes to the `state` volume.
+
+name: rust-albums
+
+services:
+  albums:
+    image: ${ALBUMS_IMAGE:?set ALBUMS_IMAGE in .env}
+    restart: unless-stopped
+    environment:
+      AUTH_USER: ${AUTH_USER:?set AUTH_USER in .env}
+      AUTH_PASS: ${AUTH_PASS:?set AUTH_PASS in .env}
+      # Names in the generated certificate: the host name / IP you browse to.
+      ALBUMS_TLS_NAMES: ${ALBUMS_TLS_NAMES:-localhost,127.0.0.1}
+      # Your own certificate instead (see the certificate volume below):
+      # ALBUMS_TLS_CERT: /certs/live/albums.example.com/fullchain.pem
+      # ALBUMS_TLS_KEY: /certs/live/albums.example.com/privkey.pem
+    ports:
+      - "${ALBUMS_PORT:-8443}:8443"
+    volumes:
+      # Long syntax with create_host_path: false, so a missing folder fails the
+      # start instead of being created empty.
+      - type: bind
+        source: ${PHOTOS_DIR:?set PHOTOS_DIR in .env}
+        target: /photos
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: state
+        target: /state
+      # Certificates from certbot: mount the whole folder, since live/ holds
+      # symlinks into archive/. Renewals: docs/configuration.md#certificates.
+      # - type: bind
+      #   source: /etc/letsencrypt
+      #   target: /certs
+      #   read_only: true
+    # The image runs as uid/gid 65532. If your photos aren't world-readable,
+    # add a group that can read them, e.g. the owner's group id:
+    # group_add: ["1000"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  state:

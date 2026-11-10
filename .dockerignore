@@ -1,0 +1,7 @@
+# Allowlist: only what the build needs goes into the build context, so local
+# state and secrets (albums.toml, link.key, certs/, .env) can never reach an image.
+*
+!Cargo.toml
+!Cargo.lock
+!albums.default.toml
+!src
