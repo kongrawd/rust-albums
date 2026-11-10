@@ -471,6 +471,11 @@ impl Library {
 }
 
 impl Snapshot {
+    /// The album with this link id.
+    pub fn album(&self, id: &str) -> Option<&Album> {
+        self.albums.iter().find(|album| album.id == id)
+    }
+
     fn with_storage(&self, storage: StorageState) -> Self {
         Self {
             albums: self.albums.clone(),

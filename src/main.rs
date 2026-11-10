@@ -9,6 +9,8 @@ mod tls;
 mod session;
 mod routes;
 mod auth;
+mod html;
+mod web;
 
 use std::{sync::Arc, time::Duration};
 
