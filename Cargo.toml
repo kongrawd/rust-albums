@@ -22,7 +22,7 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 ring = "0.17"
 
 # Auth / storage / misc
-base64 = "0.22"
+base64 = "0.23"
 subtle = "2"
 walkdir = "2"
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
