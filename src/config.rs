@@ -3,9 +3,12 @@
 //! config path on first run. Unknown keys are rejected to catch typos. A few
 //! `ALBUMS_*` environment variables override the file, for containers.
 
+use crate::crypto;
 use crate::pattern::Pattern;
 use serde::{Deserialize, Deserializer};
+use std::fmt::Display;
 use std::fs;
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -83,6 +86,23 @@ pub enum TlsVersion {
     Tls13,
 }
 
+/// Whether the config file exists. Only a missing path counts as missing: a
+/// symlink to a missing file, a folder or an inaccessible path is an error,
+/// rather than a reason to write a default config.
+fn config_file_exists(path: &Path) -> Result<bool, String> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err("is not a file".into()),
+        Err(err) if err.kind() == ErrorKind::NotFound => match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err("is a symlink to a file that isn't there".into())
+            }
+            _ => Ok(false),
+        },
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 /// Reads a whole number of seconds (the `*_secs` keys) as a [`Duration`].
 fn seconds<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
     u64::deserialize(deserializer).map(Duration::from_secs)
@@ -96,16 +116,17 @@ pub fn path() -> PathBuf {
 }
 
 impl Config {
-    /// Reads the config at `path`, first writing the defaults there if it
-    /// doesn't exist, then applies `ALBUMS_*` environment overrides.
+    /// Reads the config at `path`, first writing the default config there if
+    /// it doesn't exist, then applies `ALBUMS_*` environment overrides. The
+    /// default config is written atomically, so a process starting at the same
+    /// moment never reads it half-written; if two processes both write it, they
+    /// write identical contents. An existing config is never rewritten.
     pub fn load_or_create(path: &Path) -> Result<Self, String> {
-        let describe = |err: &dyn std::fmt::Display| format!("config {}: {err}", path.display());
-        if !path.exists() {
-            println!("writing default config -> {}", path.display());
-            if let Some(dir) = path.parent() {
-                fs::create_dir_all(dir).map_err(|e| describe(&e))?;
-            }
-            fs::write(path, DEFAULT_CONFIG_TOML).map_err(|e| describe(&e))?;
+        let describe = |err: &dyn Display| format!("config {}: {err}", path.display());
+        if !config_file_exists(path).map_err(|e| describe(&e))? {
+            crypto::write_file_atomically(path, DEFAULT_CONFIG_TOML.as_bytes())
+                .map_err(|e| describe(&e))?;
+            println!("wrote default config -> {}", path.display());
         }
         let text = fs::read_to_string(path).map_err(|e| describe(&e))?;
         let mut config: Self = toml::from_str(&text).map_err(|e| describe(&e))?;
@@ -241,6 +262,54 @@ mod tests {
             .apply_overrides(bad)
             .unwrap_err();
         assert!(error.contains("ALBUMS_BIND_ADDR"), "{error}");
+    }
+
+    #[test]
+    fn concurrent_first_runs_share_one_default_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state/albums.toml");
+        std::thread::scope(|scope| {
+            let starts: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| Config::load_or_create(&path).map(|_| ())))
+                .collect();
+            for start in starts {
+                start.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(fs::read_to_string(&path).unwrap(), DEFAULT_CONFIG_TOML);
+        let names: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["albums.toml"], "no temporary files left");
+    }
+
+    #[test]
+    fn an_existing_config_is_never_rewritten_and_errors_are_immediate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("albums.toml");
+        fs::write(&path, "[server\n").unwrap();
+        let started = std::time::Instant::now();
+        let error = Config::load_or_create(&path).err().unwrap();
+        assert!(error.contains("albums.toml"), "{error}");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "[server\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_or_a_folder_is_reported_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("albums.toml");
+        std::os::unix::fs::symlink(dir.path().join("missing.toml"), &link).unwrap();
+        let error = Config::load_or_create(&link).err().unwrap();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(!dir.path().join("missing.toml").exists());
+
+        let folder = dir.path().join("folder.toml");
+        fs::create_dir(&folder).unwrap();
+        let error = Config::load_or_create(&folder).err().unwrap();
+        assert!(error.contains("not a file"), "{error}");
     }
 
     #[test]
