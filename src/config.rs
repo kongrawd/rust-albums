@@ -69,7 +69,7 @@ pub struct Tls {
     pub hsts_max_age: Duration,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone, Copy)]
 #[serde(deny_unknown_fields)]
 pub struct Session {
     #[serde(rename = "idle_timeout_secs", deserialize_with = "seconds")]

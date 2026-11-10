@@ -6,5 +6,6 @@ mod config;
 mod link_ids;
 mod library;
 mod tls;
+mod session;
 
 fn main() {}
