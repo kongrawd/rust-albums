@@ -13,7 +13,10 @@
 //! them; time while the host is suspended isn't counted.
 //!
 //! Single instance only: another replica can't see these sessions, and
-//! restarting the server signs everyone out (see README "POC limitations").
+//! restarting the server signs everyone out (see docs/architecture.md "Single replica").
+//!
+//! Not tower-sessions: its in-memory store never deletes expired sessions,
+//! keeps the raw session ids and has no absolute lifetime.
 
 use crate::config;
 use crate::crypto::{Digest, random, sha256};

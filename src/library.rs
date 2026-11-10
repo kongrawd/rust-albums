@@ -1,6 +1,6 @@
 //! The album library: turns the root into albums using a [`Pattern`]. Terms
 //! (root, marker, album, item, path, link id, scan, snapshot) are as defined in
-//! README.md "Terminology".
+//! docs/architecture.md "Terminology".
 //!
 //! Scans run in the background ([`Library::run_scanner`]); requests read the
 //! latest [`Snapshot`] and never walk the root. Scans are idempotent and safe
@@ -10,6 +10,10 @@
 //! link ids of the last successful scan and only marks storage unavailable, so
 //! an outage never looks like an empty root. Failed scans are retried sooner,
 //! with backoff, until one succeeds.
+//!
+//! Scans poll instead of watching for changes (notify/inotify): watching misses
+//! changes on NFS/SMB and from the Windows side of WSL2, and its polling
+//! fallback is another full walk anyway.
 
 use crate::config;
 use crate::link_ids::LinkIds;
@@ -131,7 +135,8 @@ pub enum MediaKind {
 }
 
 impl MediaKind {
-    /// Only formats browsers can display inline count as items.
+    /// Only formats browsers can display inline count as items. A fixed list
+    /// rather than mime_guess, which also accepts formats like tiff and avi.
     pub fn from_file_name(file_name: &str) -> Option<Self> {
         let extension = Path::new(file_name)
             .extension()?

@@ -2,6 +2,10 @@
 //! session cookie (see `session`). Scripts and tools (curl, wget) may instead
 //! send HTTP Basic credentials (RFC 7617) on every request. Only safe over TLS.
 //! Failed attempts of either kind are throttled per client ([`Throttle`]).
+//!
+//! Basic credentials are checked here rather than with tower-http's
+//! `ValidateRequestHeaderLayer::basic`, which compares the whole header with
+//! `==` (not constant-time) and matches the scheme case-sensitively.
 
 use crate::crypto::{Digest, digests_equal, sha256};
 use crate::{AppState, routes};
@@ -192,8 +196,8 @@ pub async fn require_sign_in(
 }
 
 /// Browsers send Fetch Metadata on every HTTPS request, older ones
-/// `Upgrade-Insecure-Requests` on navigations, and all of them a `Mozilla/5.0`
-/// user agent. Scripts and tools send none of these; one that fakes a browser
+/// `Upgrade-Insecure-Requests` on navigations, and all of them a user agent
+/// starting with `Mozilla/`. Scripts and tools send none of these; one that fakes a browser
 /// user agent only loses Basic auth.
 fn is_browser(headers: &HeaderMap) -> bool {
     headers.contains_key("sec-fetch-site")

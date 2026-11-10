@@ -18,6 +18,8 @@ pub fn sha256(data: &[u8]) -> Digest {
 }
 
 /// Compares digests without revealing, through timing, where they differ.
+/// Uses `subtle`: ring's `constant_time` is deprecated and makes "no promises
+/// regarding side channels".
 pub fn digests_equal(a: &Digest, b: &Digest) -> bool {
     a.ct_eq(b).into()
 }

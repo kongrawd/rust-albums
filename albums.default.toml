@@ -4,8 +4,7 @@
 # edit that local copy. Relative paths, here and in the ALBUMS_* overrides below,
 # are resolved against the config file's folder.
 # Secrets are never stored here: set AUTH_USER and AUTH_PASS in the environment.
-# In containers, ALBUMS_BIND_ADDR, ALBUMS_STORAGE_ROOT, ALBUMS_TLS_CERT, ALBUMS_TLS_KEY
-# and ALBUMS_TLS_NAMES override the matching settings below (see README).
+# Some settings can be overridden with ALBUMS_* variables: see docs/configuration.md.
 
 [server]
 # The only listener, and it is HTTPS. There is deliberately no plain-HTTP port.
@@ -38,10 +37,9 @@ ignore = ["@eaDir", "#recycle", "$RECYCLE.BIN", "System Volume Information", "lo
 link_key = "./link.key"
 
 [tls]
-# PEM certificate chain and private key, e.g. mounted from certbot, Traefik or a
-# Kubernetes secret. If both are missing, a self-signed pair is generated for
-# `self_signed_names`; if only one is missing, startup fails rather than replace it.
-# Restart the server after a renewal.
+# PEM certificate chain and private key. If both are missing, a self-signed pair
+# is generated for `self_signed_names`. Your own certificate, renewals and new
+# names: docs/configuration.md#certificates.
 cert = "./certs/cert.pem"
 key = "./certs/key.pem"
 self_signed_names = ["localhost", "127.0.0.1"]
@@ -52,8 +50,7 @@ min_version = "1.3"
 hsts_max_age_secs = 31536000
 
 [session]
-# Browser sessions are kept in memory on the server; restarting signs everyone out.
-# A session ends after this much inactivity (30 min)...
+# A browser session ends after this much inactivity (30 min)...
 idle_timeout_secs = 1800
 # ...and at the latest this long after signing in, however active (12 h).
 max_lifetime_secs = 43200

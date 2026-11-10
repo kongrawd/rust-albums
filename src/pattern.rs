@@ -4,6 +4,9 @@
 //! Each `/`-separated segment is a template of literal text and `{name}`
 //! placeholders. All segments but the last describe the album folder; the last
 //! describes the file. Placeholder values become album / item metadata.
+//!
+//! Parsed here rather than with matchit (axum's router), which can't handle
+//! `year={year}` or two placeholders in one segment.
 
 use regex::Regex;
 use std::collections::{BTreeMap, HashSet};

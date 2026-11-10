@@ -217,7 +217,8 @@ async fn serve_item(
     let open = async {
         let file = state.library.item_file(&item_path).await;
         let file = file.ok_or(StatusCode::NOT_FOUND)?;
-        // ServeFile handles Content-Type, Range (video seeking) and conditional requests.
+        // ServeFile handles Content-Type, Range (video seeking) and conditional
+        // requests. No sendfile: rustls encrypts in user space, so zero-copy can't apply.
         let Ok(response) = ServeFile::new(file).oneshot(request).await;
         Ok(response)
     };

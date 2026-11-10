@@ -1,10 +1,10 @@
 //! TLS setup: rustls server config (using the ring provider that main.rs
 //! installs) with a configurable minimum version.
 //!
-//! Works with certificates mounted read-only into a container (certbot,
-//! Traefik, Kubernetes secrets): a self-signed pair is only generated when both
-//! files are missing, and never overwrites anything. Restart the server after a
-//! renewal.
+//! Works with PEM certificates mounted read-only into a container (certbot,
+//! Kubernetes secrets): a self-signed pair is only generated when both files
+//! are missing, and never overwrites anything. Certificates are read once, at
+//! startup.
 //!
 //! Generating is safe when two processes start at once (e.g. two containers on
 //! one state volume): the key is created with `create_new`, so exactly one
@@ -121,7 +121,7 @@ fn access_error(path: &Path, err: &io::Error) -> String {
     if err.kind() == ErrorKind::PermissionDenied {
         format!(
             "TLS: can't read {}: permission denied. Make it readable by the user the server \
-             runs as (in Docker: the container user, see README)",
+             runs as (in Docker: the container user, see docs/docker.md)",
             path.display()
         )
     } else {
