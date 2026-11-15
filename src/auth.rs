@@ -151,12 +151,13 @@ pub fn too_many_attempts(wait: Duration, body: impl IntoResponse) -> Response {
 /// Lets a request through if it has a live session, or valid Basic credentials
 /// from a non-browser client. Otherwise a browser opening a page or a direct
 /// link is sent to the sign-in form (and back afterwards); a browser loading a
-/// resource gets a bare 401; a script gets a 401 with a Basic challenge.
+/// resource gets a 403; a script gets a 401 with a Basic challenge.
 ///
 /// Browsers must always hold a session: one that ever answered a Basic prompt
 /// resends those credentials on every request until it quits, which would keep
 /// it signed in after signing out. For the same reason browsers never get the
-/// Basic challenge, which would make them show that prompt.
+/// Basic challenge, which would make them show that prompt, and so no 401
+/// either: RFC 9110 §15.5.2 requires a challenge with every 401.
 pub async fn require_sign_in(
     State(state): State<AppState>,
     request: Request,
@@ -186,7 +187,7 @@ pub async fn require_sign_in(
         return Redirect::to(&routes::sign_in_url(target)).into_response();
     }
     if browser {
-        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        return (StatusCode::FORBIDDEN, "Sign in first").into_response();
     }
     let challenge = [(
         header::WWW_AUTHENTICATE,

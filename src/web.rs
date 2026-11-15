@@ -396,13 +396,13 @@ mod tests {
     async fn sign_in_sign_out_lifecycle() {
         let (_root, app, links) = app().await;
 
-        // Signed out: pages redirect to the sign-in page; images get a bare 401 (no Basic
+        // Signed out: pages redirect to the sign-in page; images get a 403 (no Basic
         // challenge, which would make browsers cache credentials).
         let response = send(&app, open("/", None)).await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(header_of(&response, header::LOCATION), "/login?next=%2F");
         let response = send(&app, embed(&links.photo, "", "same-origin")).await;
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
 
         let response = sign_in_as(&app, MALLORY, "wrong", "/").await;
@@ -454,7 +454,7 @@ mod tests {
         let response = send(&app, open("/", Some(&cookie))).await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let response = send(&app, embed(&links.photo, &cookie, "same-origin")).await;
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     /// Failed attempts slow down only the client that made them, so nobody can
@@ -622,7 +622,7 @@ mod tests {
             (
                 "signed-out player",
                 play(&links.video, None),
-                StatusCode::UNAUTHORIZED,
+                StatusCode::FORBIDDEN,
             ),
         ];
         for (case, request, status) in cases {
@@ -700,7 +700,7 @@ mod tests {
         let response = send(&app, legacy_image).await;
         assert_eq!(
             response.status(),
-            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
             "old browser image"
         );
         assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
@@ -720,5 +720,88 @@ mod tests {
         let response = send(&app, request).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(header_of(&response, header::WWW_AUTHENTICATE).starts_with("Basic realm="));
+    }
+
+    /// Signed out, by kind of client. RFC 9110 §15.5.2: a 401 must carry a
+    /// challenge, so only tools and desktop players, which can answer one, get
+    /// a 401. Browsers must sign in on the page instead: they get the sign-in
+    /// redirect, or a 403 (§15.5.4) when loading an item.
+    #[tokio::test]
+    async fn only_clients_that_can_answer_a_challenge_get_a_401() {
+        let (_root, app, links) = app().await;
+        let old_browser_image = Request::get(&links.photo)
+            .header(header::ACCEPT, "image/*")
+            .header(header::USER_AGENT, OLD_BROWSER);
+        let tool = |path: &str| Request::get(path).header(header::USER_AGENT, "Wget/1.24");
+        let sign_in_then = |path: &str| format!("/login?next={}", path.replace('/', "%2F"));
+        let cases = [
+            (
+                "browser opening a page",
+                open("/", None),
+                StatusCode::SEE_OTHER,
+                sign_in_then("/"),
+            ),
+            (
+                "browser opening a direct link",
+                open(&links.video, None),
+                StatusCode::SEE_OTHER,
+                sign_in_then(&links.video),
+            ),
+            (
+                "browser loading an image",
+                embed(&links.photo, "", "same-origin"),
+                StatusCode::FORBIDDEN,
+                String::new(),
+            ),
+            (
+                "browser playing a video",
+                play(&links.video, None),
+                StatusCode::FORBIDDEN,
+                String::new(),
+            ),
+            (
+                "old browser loading an image",
+                old_browser_image,
+                StatusCode::FORBIDDEN,
+                String::new(),
+            ),
+            (
+                "tool",
+                tool(&links.photo),
+                StatusCode::UNAUTHORIZED,
+                String::new(),
+            ),
+            (
+                "tool streaming part of an item",
+                tool(&links.video).header(header::RANGE, "bytes=0-1"),
+                StatusCode::UNAUTHORIZED,
+                String::new(),
+            ),
+            (
+                "tool with a wrong password",
+                tool(&links.photo).header(header::AUTHORIZATION, basic("wrong")),
+                StatusCode::UNAUTHORIZED,
+                String::new(),
+            ),
+        ];
+        for (case, request, status, location) in cases {
+            let response = send(&app, request).await;
+            assert_eq!(response.status(), status, "{case}");
+            let challenge = if status == StatusCode::UNAUTHORIZED {
+                r#"Basic realm="albums", charset="UTF-8""#
+            } else {
+                ""
+            };
+            assert_eq!(
+                header_of(&response, header::WWW_AUTHENTICATE),
+                challenge,
+                "{case}"
+            );
+            assert_eq!(header_of(&response, header::LOCATION), location, "{case}");
+            // Not the cross-site check's 403.
+            if status == StatusCode::FORBIDDEN {
+                assert_eq!(body_text(response).await, "Sign in first", "{case}");
+            }
+        }
     }
 }
