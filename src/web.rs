@@ -23,10 +23,16 @@ use tower_http::{services::ServeFile, set_header::SetResponseHeaderLayer};
 /// sites can't frame the pages (clickjacking).
 const PAGE_CSP: &str = "default-src 'none'; img-src 'self'; media-src 'self'; \
     style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'";
-/// Items are files straight from storage. Opened directly, they may load
-/// nothing and run no scripts (`default-src 'none'`); `sandbox` also gives them
-/// an opaque origin with no forms. Inline styles are allowed so SVGs render.
-const ITEM_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
+/// Items are files straight from storage, and one policy fits every kind.
+/// Opened directly, they may load only their own media: a video plays in a
+/// player page the browser makes, which loads the same file in ranges. `sandbox`
+/// runs no scripts, forms or popups, even in an SVG; `allow-same-origin` keeps
+/// the file's real origin, without which the player's loads would go
+/// cross-site, lose the session cookie and be refused. Safe only without
+/// `allow-scripts`. Inline styles are allowed so SVGs render; other sites
+/// can't frame items.
+const ITEM_CSP: &str = "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; \
+    frame-ancestors 'none'; sandbox allow-same-origin";
 /// Browsers and proxies never store pages, so going Back after signing out
 /// fetches the page again and lands on the sign-in page.
 const NO_STORE: &str = "no-store";
@@ -235,21 +241,25 @@ mod tests {
     use crate::{App, auth::Credentials, config, library::Library, link_ids::LinkIds};
     use axum::{body::Body, http::request::Builder};
     use base64::{Engine, engine::general_purpose::STANDARD};
+    use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
 
+    /// Size of the test video, `b.mp4`, in bytes.
+    const VIDEO_LEN: usize = 64;
     const OLD_BROWSER: &str = "Mozilla/5.0 (Macintosh) AppleWebKit/605 Safari/605";
     const ALICE: [u8; 4] = [192, 168, 1, 10];
     const MALLORY: [u8; 4] = [10, 0, 0, 66];
 
-    /// URLs of the test album and its one item.
+    /// URLs of the test album and its items.
     struct Links {
         album: String,
-        item: String,
+        photo: String,
+        video: String,
     }
 
     /// A router over a temporary library with one album, `Trip`, holding the
-    /// items `a.svg` and `b.mp4`. The
+    /// photo `a.svg` and the video `b.mp4`. The
     /// `TempDir` deletes the files when dropped, even if the test panics.
     async fn app() -> (tempfile::TempDir, Router, Links) {
         let dir = tempfile::tempdir().unwrap();
@@ -257,11 +267,12 @@ mod tests {
         std::fs::create_dir_all(root.join("Trip")).unwrap();
         std::fs::write(root.join(".albums-root"), "").unwrap();
         std::fs::write(root.join("Trip/a.svg"), "<svg/>").unwrap();
-        std::fs::write(root.join("Trip/b.mp4"), "").unwrap();
+        std::fs::write(root.join("Trip/b.mp4"), [0u8; VIDEO_LEN]).unwrap();
         let link_ids = LinkIds::load_or_create(&dir.path().join("link.key")).unwrap();
         let links = Links {
             album: routes::album_url(&link_ids.album("Trip")),
-            item: routes::item_url(&link_ids.item("Trip/a.svg")),
+            photo: routes::item_url(&link_ids.item("Trip/a.svg")),
+            video: routes::item_url(&link_ids.item("Trip/b.mp4")),
         };
         let storage = config::Storage {
             backend: config::StorageBackend::Local,
@@ -317,10 +328,7 @@ mod tests {
             .header("sec-fetch-site", "none")
             .header("sec-fetch-mode", "navigate")
             .header("sec-fetch-dest", "document");
-        match cookie {
-            Some(cookie) => request.header(header::COOKIE, cookie),
-            None => request,
-        }
+        with_cookie(request, cookie)
     }
 
     /// A browser loading `path` as an `<img>`; `site` is the `Sec-Fetch-Site`
@@ -332,6 +340,23 @@ mod tests {
             .header("sec-fetch-site", site)
             .header("sec-fetch-mode", "no-cors")
             .header("sec-fetch-dest", "image")
+    }
+
+    /// A browser's media player loading `path`: an inline `<video>`, or the
+    /// player page of a video opened in its own tab.
+    fn play(path: &str, cookie: Option<&str>) -> Builder {
+        let request = Request::get(path)
+            .header("sec-fetch-site", "same-origin")
+            .header("sec-fetch-mode", "no-cors")
+            .header("sec-fetch-dest", "video");
+        with_cookie(request, cookie)
+    }
+
+    fn with_cookie(request: Builder, cookie: Option<&str>) -> Builder {
+        match cookie {
+            Some(cookie) => request.header(header::COOKIE, cookie),
+            None => request,
+        }
     }
 
     fn basic(password: &str) -> String {
@@ -376,7 +401,7 @@ mod tests {
         let response = send(&app, open("/", None)).await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(header_of(&response, header::LOCATION), "/login?next=%2F");
-        let response = send(&app, embed(&links.item, "", "same-origin")).await;
+        let response = send(&app, embed(&links.photo, "", "same-origin")).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
 
@@ -428,7 +453,7 @@ mod tests {
         // The old cookie is now worthless, even if a copy was kept.
         let response = send(&app, open("/", Some(&cookie))).await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        let response = send(&app, embed(&links.item, &cookie, "same-origin")).await;
+        let response = send(&app, embed(&links.photo, &cookie, "same-origin")).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -452,7 +477,7 @@ mod tests {
 
         // Basic auth shares the same per-client throttle.
         let script = |password: &str| {
-            let request = Request::get(&links.item)
+            let request = Request::get(&links.photo)
                 .header(header::USER_AGENT, "curl/8.7.1")
                 .header(header::AUTHORIZATION, basic(password));
             from(MALLORY, request)
@@ -489,20 +514,20 @@ mod tests {
         let (_root, app, links) = app().await;
 
         // Signed out: a direct link to an item goes to sign-in and remembers the link.
-        let response = send(&app, open(&links.item, None)).await;
+        let response = send(&app, open(&links.photo, None)).await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let location = header_of(&response, header::LOCATION).to_string();
-        assert_eq!(location, routes::sign_in_url(&links.item));
+        assert_eq!(location, routes::sign_in_url(&links.photo));
 
         // The sign-in form carries `next`, and signing in lands on the link.
         let html = body_text(send(&app, open(&location, None)).await).await;
-        assert!(html.contains(&format!(r#"value="{}""#, links.item)));
-        let response = sign_in_as(&app, ALICE, "pw", &links.item.replace('/', "%2F")).await;
-        assert_eq!(header_of(&response, header::LOCATION), links.item);
+        assert!(html.contains(&format!(r#"value="{}""#, links.photo)));
+        let response = sign_in_as(&app, ALICE, "pw", &links.photo.replace('/', "%2F")).await;
+        assert_eq!(header_of(&response, header::LOCATION), links.photo);
 
         // Signed in: the direct link opens.
         let cookie = session_cookie(&app).await;
-        let response = send(&app, open(&links.item, Some(&cookie))).await;
+        let response = send(&app, open(&links.photo, Some(&cookie))).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             header_of(&response, CROSS_ORIGIN_RESOURCE_POLICY),
@@ -525,7 +550,7 @@ mod tests {
         let (_root, app, links) = app().await;
         let cookie = session_cookie(&app).await;
         let html = body_text(send(&app, open(&links.album, Some(&cookie))).await).await;
-        assert!(html.contains(&format!(r#"loading="lazy" src="{}""#, links.item)));
+        assert!(html.contains(&format!(r#"loading="lazy" src="{}""#, links.photo)));
         // Browsers can't lazy-load `<video>`, so video tiles have none.
         assert!(!html.contains("<video"), "{html}");
         assert!(
@@ -534,16 +559,90 @@ mod tests {
         );
     }
 
+    /// What `ITEM_CSP` allows and forbids (its doc says why), and that every
+    /// response on an item URL carries it, whatever the file. The ranges are
+    /// the loads of a video's player page, as logged from Safari on iOS.
+    #[tokio::test]
+    async fn item_responses_share_one_policy() {
+        let policy: BTreeMap<&str, Vec<&str>> = ITEM_CSP
+            .split(';')
+            .filter_map(|directive| {
+                let mut words = directive.split_whitespace();
+                Some((words.next()?, words.collect()))
+            })
+            .collect();
+        let expected = BTreeMap::from([
+            ("default-src", vec!["'none'"]),
+            ("media-src", vec!["'self'"]),
+            ("style-src", vec!["'unsafe-inline'"]),
+            ("frame-ancestors", vec!["'none'"]),
+            ("sandbox", vec!["allow-same-origin"]),
+        ]);
+        assert_eq!(policy, expected);
+
+        let (_root, app, links) = app().await;
+        let cookie = session_cookie(&app).await;
+        let head = || Request::head(&links.video).header(header::COOKIE, &cookie);
+        let etag = header_of(&send(&app, head()).await, header::ETAG).to_string();
+        let range = |range: String| play(&links.video, Some(&cookie)).header(header::RANGE, range);
+        let cases = [
+            ("photo", open(&links.photo, Some(&cookie)), StatusCode::OK),
+            ("video", open(&links.video, Some(&cookie)), StatusCode::OK),
+            (
+                "first bytes",
+                range("bytes=0-1".into()),
+                StatusCode::PARTIAL_CONTENT,
+            ),
+            (
+                "the rest",
+                range(format!("bytes={}-", VIDEO_LEN / 2)),
+                StatusCode::PARTIAL_CONTENT,
+            ),
+            (
+                "past the end",
+                range(format!("bytes={VIDEO_LEN}-")),
+                StatusCode::RANGE_NOT_SATISFIABLE,
+            ),
+            ("head", head(), StatusCode::OK),
+            (
+                "cached",
+                open(&links.video, Some(&cookie)).header(header::IF_NONE_MATCH, etag),
+                StatusCode::NOT_MODIFIED,
+            ),
+            (
+                "unknown",
+                open(&routes::item_url("unknown"), Some(&cookie)),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "signed out",
+                open(&links.video, None),
+                StatusCode::SEE_OTHER,
+            ),
+            (
+                "signed-out player",
+                play(&links.video, None),
+                StatusCode::UNAUTHORIZED,
+            ),
+        ];
+        for (case, request, status) in cases {
+            let response = send(&app, request).await;
+            assert_eq!(response.status(), status, "{case}");
+            let csp = header_of(&response, header::CONTENT_SECURITY_POLICY);
+            assert_eq!(csp, ITEM_CSP, "{case}");
+        }
+    }
+
     #[tokio::test]
     async fn other_sites_cannot_use_the_session() {
         let (_root, app, links) = app().await;
         let cookie = session_cookie(&app).await;
 
         // Our own pages may load items; other sites may not, even with the cookie.
-        let ours = send(&app, embed(&links.item, &cookie, "same-origin")).await;
+        let ours = send(&app, embed(&links.photo, &cookie, "same-origin")).await;
         assert_eq!(ours.status(), StatusCode::OK);
         for site in ["cross-site", "same-site"] {
-            let theirs = send(&app, embed(&links.item, &cookie, site)).await;
+            let theirs = send(&app, embed(&links.photo, &cookie, site)).await;
             assert_eq!(theirs.status(), StatusCode::FORBIDDEN, "{site}");
         }
 
@@ -594,7 +693,7 @@ mod tests {
 
         // An old browser's `<img>` request has no Fetch Metadata and no
         // `Upgrade-Insecure-Requests`, only its `Mozilla/` user agent.
-        let legacy_image = Request::get(&links.item)
+        let legacy_image = Request::get(&links.photo)
             .header(header::ACCEPT, "image/*")
             .header(header::USER_AGENT, OLD_BROWSER)
             .header(header::AUTHORIZATION, basic("pw"));
@@ -610,14 +709,14 @@ mod tests {
     #[tokio::test]
     async fn scripts_use_basic_auth() {
         let (_root, app, links) = app().await;
-        let request = Request::get(&links.item)
+        let request = Request::get(&links.photo)
             .header(header::USER_AGENT, "curl/8.7.1")
             .header(header::AUTHORIZATION, basic("pw"));
         assert_eq!(send(&app, request).await.status(), StatusCode::OK);
 
         // Without credentials they get a standard challenge (RFC 9110 §11), so
         // tools such as wget or `curl --anyauth` know to send them.
-        let request = Request::get(&links.item).header(header::USER_AGENT, "Wget/1.24");
+        let request = Request::get(&links.photo).header(header::USER_AGENT, "Wget/1.24");
         let response = send(&app, request).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(header_of(&response, header::WWW_AUTHENTICATE).starts_with("Basic realm="));
