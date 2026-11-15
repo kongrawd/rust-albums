@@ -50,7 +50,7 @@ impl LinkIds {
         let describe = |err: &dyn Display| format!("link key {}: {err}", path.display());
         let wait = match crypto::create_secret_file(path, &crypto::random::<KEY_BYTES>()) {
             Ok(()) => {
-                println!("generated link key -> {}", path.display());
+                eprintln!("generated link key -> {}", path.display());
                 Duration::ZERO
             }
             Err(err) if err.kind() == ErrorKind::AlreadyExists => wait,

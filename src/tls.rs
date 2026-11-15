@@ -199,7 +199,7 @@ fn create_self_signed(settings: &config::Tls) -> Result<Generation, String> {
         let _ = fs::remove_file(&settings.key);
         return Err(write_error(&settings.cert, err));
     }
-    println!(
+    eprintln!(
         "generated self-signed certificate for {:?} -> {} (key {})",
         settings.self_signed_names,
         settings.cert.display(),

@@ -126,7 +126,7 @@ impl Config {
         if !config_file_exists(path).map_err(|e| describe(&e))? {
             crypto::write_file_atomically(path, DEFAULT_CONFIG_TOML.as_bytes())
                 .map_err(|e| describe(&e))?;
-            println!("wrote default config -> {}", path.display());
+            eprintln!("wrote default config -> {}", path.display());
         }
         let text = fs::read_to_string(path).map_err(|e| describe(&e))?;
         let mut config: Self = toml::from_str(&text).map_err(|e| describe(&e))?;
