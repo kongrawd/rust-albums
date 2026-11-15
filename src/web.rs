@@ -490,6 +490,8 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "still waiting"
         );
+        assert_eq!(header_of(&response, header::RETRY_AFTER), "1");
+        assert_eq!(body_text(response).await, "Too many attempts");
     }
 
     #[tokio::test]
@@ -673,6 +675,11 @@ mod tests {
             .header(header::COOKIE, &cookie)
             .header(header::USER_AGENT, OLD_BROWSER);
         assert_eq!(send(&app, anonymous).await.status(), StatusCode::FORBIDDEN);
+        // A tool sends neither either, but can't be tricked into posting.
+        let tool = Request::post(routes::SIGN_OUT)
+            .header(header::COOKIE, &cookie)
+            .header(header::USER_AGENT, "curl/8.7.1");
+        assert_eq!(send(&app, tool).await.status(), StatusCode::SEE_OTHER);
     }
 
     /// A browser that cached Basic credentials (e.g. from an earlier password
@@ -769,10 +776,22 @@ mod tests {
                 String::new(),
             ),
             (
+                "browser known only by Upgrade-Insecure-Requests",
+                Request::get(&links.photo).header("upgrade-insecure-requests", "1"),
+                StatusCode::FORBIDDEN,
+                String::new(),
+            ),
+            (
                 "tool",
                 tool(&links.photo),
                 StatusCode::UNAUTHORIZED,
                 String::new(),
+            ),
+            (
+                "tool asking for a page",
+                tool("/").header(header::ACCEPT, "text/html"),
+                StatusCode::SEE_OTHER,
+                sign_in_then("/"),
             ),
             (
                 "tool streaming part of an item",

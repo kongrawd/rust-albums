@@ -149,15 +149,12 @@ pub fn too_many_attempts(wait: Duration, body: impl IntoResponse) -> Response {
 }
 
 /// Lets a request through if it has a live session, or valid Basic credentials
-/// from a non-browser client. Otherwise a browser opening a page or a direct
-/// link is sent to the sign-in form (and back afterwards); a browser loading a
-/// resource gets a 403; a script gets a 401 with a Basic challenge.
+/// from a tool (429 while that client is throttled); otherwise answers with
+/// [`sign_in_needed`].
 ///
 /// Browsers must always hold a session: one that ever answered a Basic prompt
 /// resends those credentials on every request until it quits, which would keep
-/// it signed in after signing out. For the same reason browsers never get the
-/// Basic challenge, which would make them show that prompt, and so no 401
-/// either: RFC 9110 §15.5.2 requires a challenge with every 401.
+/// it signed in after signing out.
 pub async fn require_sign_in(
     State(state): State<AppState>,
     request: Request,
@@ -167,8 +164,10 @@ pub async fn require_sign_in(
     if state.sessions.is_signed_in(headers) {
         return next.run(request).await;
     }
-    let browser = is_browser(headers);
-    if !browser && let Some(Authorization(basic)) = headers.typed_get::<Authorization<Basic>>() {
+    let caller = Caller::from_headers(headers);
+    if caller == Caller::Tool
+        && let Some(Authorization(basic)) = headers.typed_get::<Authorization<Basic>>()
+    {
         let client = client_ip(request.extensions().get());
         match state
             .credentials
@@ -179,32 +178,56 @@ pub async fn require_sign_in(
             Verdict::Invalid => {}
         }
     }
-    if accepts_html(headers) {
+    sign_in_needed(caller, &request)
+}
+
+/// The answer to a request without a session or valid credentials. A page or
+/// a direct link opened in a browser goes to the sign-in form (and back
+/// afterwards). Otherwise a tool gets a 401 with the Basic challenge, and a
+/// browser a 403: it must never get the challenge, which would make it show a
+/// password prompt, and so no 401 either, as RFC 9110 §15.5.2 requires a
+/// challenge with every 401.
+fn sign_in_needed(caller: Caller, request: &Request) -> Response {
+    if accepts_html(request.headers()) {
         let target = request
             .uri()
             .path_and_query()
             .map_or(routes::HOME, |t| t.as_str());
         return Redirect::to(&routes::sign_in_url(target)).into_response();
     }
-    if browser {
-        return (StatusCode::FORBIDDEN, "Sign in first").into_response();
+    match caller {
+        Caller::Browser => (StatusCode::FORBIDDEN, "Sign in first").into_response(),
+        Caller::Tool => {
+            let challenge = [(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static(BASIC_CHALLENGE),
+            )];
+            (StatusCode::UNAUTHORIZED, challenge, "Unauthorized").into_response()
+        }
     }
-    let challenge = [(
-        header::WWW_AUTHENTICATE,
-        HeaderValue::from_static(BASIC_CHALLENGE),
-    )];
-    (StatusCode::UNAUTHORIZED, challenge, "Unauthorized").into_response()
 }
 
-/// Browsers send Fetch Metadata on every HTTPS request, older ones
-/// `Upgrade-Insecure-Requests` on navigations, and all of them a user agent
-/// starting with `Mozilla/`. Scripts and tools send none of these; one that fakes a browser
-/// user agent only loses Basic auth.
-fn is_browser(headers: &HeaderMap) -> bool {
-    headers.contains_key("sec-fetch-site")
-        || headers.contains_key("upgrade-insecure-requests")
-        || header_text(headers, header::USER_AGENT)
-            .is_some_and(|agent| agent.starts_with("Mozilla/"))
+/// What kind of software is asking, as far as signing in goes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Caller {
+    /// Signs in on the sign-in page and holds a session; never uses Basic.
+    Browser,
+    /// Scripts and tools, which may send Basic credentials.
+    Tool,
+}
+
+impl Caller {
+    /// Browsers send Fetch Metadata on every HTTPS request, older ones
+    /// `Upgrade-Insecure-Requests` on navigations, and all of them a user agent
+    /// starting with `Mozilla/`. Tools send none of these; one that fakes a
+    /// browser user agent only loses Basic auth.
+    fn from_headers(headers: &HeaderMap) -> Self {
+        let browser = headers.contains_key("sec-fetch-site")
+            || headers.contains_key("upgrade-insecure-requests")
+            || header_text(headers, header::USER_AGENT)
+                .is_some_and(|agent| agent.starts_with("Mozilla/"));
+        if browser { Self::Browser } else { Self::Tool }
+    }
 }
 
 fn accepts_html(headers: &HeaderMap) -> bool {
@@ -242,7 +265,7 @@ fn is_allowed_initiator(request: &Request) -> bool {
         // refused; scripts and tools can't be tricked into posting anyway.
         None => match header_text(headers, header::ORIGIN) {
             Some(origin) => origin_matches_host(request, origin),
-            None => !is_browser(headers),
+            None => Caller::from_headers(headers) == Caller::Tool,
         },
     }
 }
@@ -369,14 +392,14 @@ mod tests {
             }
             map
         };
-        assert!(is_browser(&headers(&[("sec-fetch-site", "none")])));
-        assert!(is_browser(&headers(&[("upgrade-insecure-requests", "1")])));
-        assert!(is_browser(&headers(&[(
-            "user-agent",
-            "Mozilla/5.0 (X11) Safari/605"
-        )])));
-        assert!(!is_browser(&headers(&[("user-agent", "curl/8.7.1")])));
-        assert!(!is_browser(&headers(&[])));
+        let caller = |pairs| Caller::from_headers(&headers(pairs));
+        assert_eq!(caller(&[("sec-fetch-site", "none")]), Caller::Browser);
+        let old_browser = [("upgrade-insecure-requests", "1")];
+        assert_eq!(caller(&old_browser), Caller::Browser);
+        let safari = [("user-agent", "Mozilla/5.0 (X11) Safari/605")];
+        assert_eq!(caller(&safari), Caller::Browser);
+        assert_eq!(caller(&[("user-agent", "curl/8.7.1")]), Caller::Tool);
+        assert_eq!(caller(&[]), Caller::Tool);
     }
 
     #[test]
