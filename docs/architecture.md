@@ -15,8 +15,10 @@ These terms mean the same thing in the code and the docs.
 | **placeholder** | A `{name}` in a pattern segment. The value it captures becomes **metadata**. |
 | **album** | A folder matching the pattern's folder segments. Its **name** comes from `{album_name}`, falling back to the folder name. |
 | **item** | A media file in an album, matching the pattern's last segment. |
+| **original** | An item's file exactly as stored, served unchanged. |
+| **item page** | The page showing one item, with a link to its original. |
 | **path** | Always `/`-separated and relative to the root (album path, item path). |
-| **link id** | The fixed-length id used in URLs instead of an album or item path. |
+| **link id** | The fixed-length id used in URLs instead of an album or item path. An item's page and its original share one. |
 | **page title** | A fixed string per page type. |
 | **scan** | A background walk of the root that refreshes the albums. |
 | **snapshot** | The albums and link ids of the last successful scan, plus the state of the latest scan. Requests read it. |

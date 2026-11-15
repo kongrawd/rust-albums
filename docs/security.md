@@ -42,5 +42,6 @@ All routes require a session or Basic credentials, except `/login`, `/logout` an
 | `POST /logout` | Sign out |
 | `GET /` | Album list |
 | `GET /albums/{album_id}` | One album's items |
+| `GET /items/{item_id}` | One photo or video, shown in the page |
 | `GET /media/{item_id}` | The original file, with Range support (video seeking) |
 | `GET /healthz` | 200 `ok`, or 503 with a generic reason while storage is unavailable |

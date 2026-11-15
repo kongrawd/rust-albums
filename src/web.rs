@@ -23,31 +23,31 @@ use tower_http::{services::ServeFile, set_header::SetResponseHeaderLayer};
 /// sites can't frame the pages (clickjacking).
 const PAGE_CSP: &str = "default-src 'none'; img-src 'self'; media-src 'self'; \
     style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'";
-/// Items are files straight from storage, and one policy fits every kind.
+/// Originals are files straight from storage, and one policy fits every kind.
 /// Opened directly, they may load only their own media: a video plays in a
 /// player page the browser makes, which loads the same file in ranges. `sandbox`
 /// runs no scripts, forms or popups, even in an SVG; `allow-same-origin` keeps
 /// the file's real origin, without which the player's loads would go
 /// cross-site, lose the session cookie and be refused. Safe only without
 /// `allow-scripts`. Inline styles are allowed so SVGs render; other sites
-/// can't frame items.
-const ITEM_CSP: &str = "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; \
+/// can't frame originals.
+const ORIGINAL_CSP: &str = "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; \
     frame-ancestors 'none'; sandbox allow-same-origin";
 /// Browsers and proxies never store pages, so going Back after signing out
 /// fetches the page again and lands on the sign-in page.
 const NO_STORE: &str = "no-store";
-/// Items may be cached only by the browser (`private`, never by a shared
+/// Originals may be cached only by the browser (`private`, never by a shared
 /// proxy) and must be revalidated before reuse (`no-cache`), which needs a live
 /// session.
-const ITEM_CACHE: &str = "private, no-cache";
-/// Clears the cached items and anything else the browser stored for this site
+const ORIGINAL_CACHE: &str = "private, no-cache";
+/// Clears the cached originals and anything else the browser stored for this site
 /// (`"storage"`: e.g. local storage, which these pages don't use today). Not
 /// `"cookies"`: that would clear cookies of the whole registrable domain,
 /// signing users out of sibling sites. The session cookie is expired directly.
 const SIGN_OUT_CLEAR_SITE_DATA: &str = r#""cache", "storage""#;
-/// Limit on finding an item's file, opening it and reading its metadata; past
+/// Limit on finding an item's original, opening it and reading its metadata; past
 /// it the request gets a 503. Sending the body has no limit.
-const ITEM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+const ORIGINAL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEAR_SITE_DATA: HeaderName = HeaderName::from_static("clear-site-data");
 const CROSS_ORIGIN_RESOURCE_POLICY: HeaderName =
     HeaderName::from_static("cross-origin-resource-policy");
@@ -60,7 +60,7 @@ const CROSS_ORIGIN_RESOURCE_POLICY: HeaderName =
 ///   already has.
 /// - Checks use `route_layer`, so they only run for known routes: an unknown
 ///   path gets a plain 404 instead of a sign-in redirect.
-/// - The cross-site check wraps the page and item headers, so its 403 carries
+/// - The cross-site check wraps the page and original headers, so its 403 carries
 ///   only the headers every response gets (nosniff, CORP and HSTS).
 pub fn router(state: AppState) -> Router {
     let sign_in_required = middleware::from_fn_with_state(state.clone(), auth::require_sign_in);
@@ -71,22 +71,23 @@ pub fn router(state: AppState) -> Router {
     let album_pages = Router::new()
         .route(routes::HOME, get(list_albums))
         .route(routes::ALBUM, get(show_album))
+        .route(routes::ITEM_PAGE, get(show_item))
         .route_layer(sign_in_required.clone());
     let pages = sign_in_pages
         .merge(album_pages)
         .layer(set_header(header::CONTENT_SECURITY_POLICY, PAGE_CSP))
         .layer(set_header(header::CACHE_CONTROL, NO_STORE));
 
-    let items = Router::new()
-        .route(routes::ITEM, get(serve_item))
+    let originals = Router::new()
+        .route(routes::ORIGINAL, get(serve_original))
         .route_layer(sign_in_required)
-        .layer(set_header(header::CONTENT_SECURITY_POLICY, ITEM_CSP))
-        .layer(set_header(header::CACHE_CONTROL, ITEM_CACHE));
+        .layer(set_header(header::CONTENT_SECURITY_POLICY, ORIGINAL_CSP))
+        .layer(set_header(header::CACHE_CONTROL, ORIGINAL_CACHE));
 
     // Cross-site checks run before the sign-in check, so another site can't use
     // the user's session at all; `/healthz` stays open for monitoring.
     let site = pages
-        .merge(items)
+        .merge(originals)
         .route_layer(middleware::from_fn(auth::reject_cross_site));
 
     Router::new()
@@ -206,6 +207,16 @@ async fn show_album(
     Ok(html::album_detail(&snapshot, album))
 }
 
+/// An item's page: the same link id as its original at [`routes::ORIGINAL`].
+async fn show_item(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+) -> Result<Markup, StatusCode> {
+    let snapshot = state.library.snapshot();
+    let (album, item) = snapshot.item(&item_id).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(html::item_page(&snapshot, album, item))
+}
+
 /// 200 while storage is available, else 503 with a generic reason (this route
 /// is public, so no paths or details). For monitoring and container health checks.
 async fn healthz(State(state): State<AppState>) -> (StatusCode, String) {
@@ -218,7 +229,7 @@ async fn healthz(State(state): State<AppState>) -> (StatusCode, String) {
     (status, storage.to_string())
 }
 
-async fn serve_item(
+async fn serve_original(
     State(state): State<AppState>,
     Path(item_id): Path<String>,
     request: Request,
@@ -237,7 +248,7 @@ async fn serve_item(
     };
     // A hung mount must not hang the request too: finding the file, opening it
     // and reading its metadata all share one time limit.
-    tokio::time::timeout(ITEM_OPEN_TIMEOUT, open)
+    tokio::time::timeout(ORIGINAL_OPEN_TIMEOUT, open)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
 }
@@ -263,6 +274,9 @@ mod tests {
         album: String,
         photo: String,
         video: String,
+        /// The pages showing the photo and the video.
+        photo_page: String,
+        video_page: String,
     }
 
     /// A router over a temporary library with one album, `Trip`, holding the
@@ -282,10 +296,13 @@ mod tests {
         std::fs::write(root.join("Trip/a.svg"), "<svg/>").unwrap();
         std::fs::write(root.join("Trip/b.mp4"), [0u8; VIDEO_LEN]).unwrap();
         let link_ids = LinkIds::load_or_create(&dir.path().join("link.key")).unwrap();
+        let (photo_id, video_id) = (link_ids.item("Trip/a.svg"), link_ids.item("Trip/b.mp4"));
         let links = Links {
             album: routes::album_url(&link_ids.album("Trip")),
-            photo: routes::item_url(&link_ids.item("Trip/a.svg")),
-            video: routes::item_url(&link_ids.item("Trip/b.mp4")),
+            photo: routes::original_url(&photo_id),
+            video: routes::original_url(&video_id),
+            photo_page: routes::item_page_url(&photo_id),
+            video_page: routes::item_page_url(&video_id),
         };
         let storage = config::Storage {
             backend: config::StorageBackend::Local,
@@ -576,12 +593,12 @@ mod tests {
         );
     }
 
-    /// What `ITEM_CSP` allows and forbids (its doc says why), and that every
-    /// response on an item URL carries it, whatever the file. The ranges are
+    /// What `ORIGINAL_CSP` allows and forbids (its doc says why), and that every
+    /// response on an original's URL carries it, whatever the file. The ranges are
     /// the loads of a video's player page, as logged from Safari on iOS.
     #[tokio::test]
-    async fn item_responses_share_one_policy() {
-        let policy: BTreeMap<&str, Vec<&str>> = ITEM_CSP
+    async fn originals_share_one_policy() {
+        let policy: BTreeMap<&str, Vec<&str>> = ORIGINAL_CSP
             .split(';')
             .filter_map(|directive| {
                 let mut words = directive.split_whitespace();
@@ -628,7 +645,7 @@ mod tests {
             ),
             (
                 "unknown",
-                open(&routes::item_url("unknown"), Some(&cookie)),
+                open(&routes::original_url("unknown"), Some(&cookie)),
                 StatusCode::NOT_FOUND,
             ),
             (
@@ -646,7 +663,7 @@ mod tests {
             let response = send(&app, request).await;
             assert_eq!(response.status(), status, "{case}");
             let csp = header_of(&response, header::CONTENT_SECURITY_POLICY);
-            assert_eq!(csp, ITEM_CSP, "{case}");
+            assert_eq!(csp, ORIGINAL_CSP, "{case}");
         }
     }
 
@@ -919,5 +936,76 @@ mod tests {
             assert!(time.ends_with(" +0000"), "UTC: {line}");
             assert_eq!(&line.replacen(time, "TIME", 1), expected);
         }
+    }
+
+    /// A tile opens the item's own page in the same tab: the photo or video
+    /// embedded, the way back to the album and the original file.
+    #[tokio::test]
+    async fn tiles_open_item_pages() {
+        let (_root, app, links) = app().await;
+        let cookie = session_cookie(&app).await;
+        let album = body_text(send(&app, open(&links.album, Some(&cookie))).await).await;
+        for page in [&links.photo_page, &links.video_page] {
+            let tile = format!(r#"<a class="tile" href="{page}""#);
+            assert!(album.contains(&tile), "{album}");
+        }
+        assert!(!album.contains("target="), "{album}");
+
+        for (page, title, media, original) in [
+            (
+                &links.photo_page,
+                "Photo",
+                format!(r#"<img src="{}" alt="a.svg">"#, links.photo),
+                &links.photo,
+            ),
+            (
+                &links.video_page,
+                "Video",
+                format!(
+                    r#"<video controls playsinline preload="metadata"><source src="{}">"#,
+                    links.video
+                ),
+                &links.video,
+            ),
+        ] {
+            let response = send(&app, open(page, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::OK, "{page}");
+            let csp = header_of(&response, header::CONTENT_SECURITY_POLICY);
+            assert_eq!(csp, PAGE_CSP, "{page}");
+            assert_eq!(
+                header_of(&response, header::CACHE_CONTROL),
+                NO_STORE,
+                "{page}"
+            );
+            let html = body_text(response).await;
+            assert!(html.contains(&format!("<h1>{title}</h1>")), "{html}");
+            assert!(html.contains(&media), "{html}");
+            let back = format!(r#"<a href="{}">← Trip</a>"#, links.album);
+            assert!(html.contains(&back), "{html}");
+            let open_original =
+                format!(r#"<a href="{original}" target="_blank">Open original</a>"#);
+            assert!(html.contains(&open_original), "{html}");
+        }
+    }
+
+    /// Item pages take the same link ids as items, and nothing else.
+    #[tokio::test]
+    async fn item_pages_take_only_item_link_ids() {
+        let (_root, app, links) = app().await;
+        let cookie = session_cookie(&app).await;
+        let album_id = links.album.trim_start_matches("/albums/");
+        for page in [
+            routes::item_page_url("unknown"),
+            routes::item_page_url(album_id),
+        ] {
+            let response = send(&app, open(&page, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{page}");
+        }
+
+        // Signed out: sign in, then back to the page.
+        let response = send(&app, open(&links.photo_page, None)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = header_of(&response, header::LOCATION);
+        assert_eq!(location, routes::sign_in_url(&links.photo_page));
     }
 }
