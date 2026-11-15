@@ -2,9 +2,9 @@
 //! every interpolated value is HTML-escaped automatically (the constant
 //! `STYLE` is the one exception). No JavaScript.
 //!
-//! Page titles and headings are fixed strings ("Albums", "Album", "Sign in"):
-//! one title per page type keeps the templates simple, and album names and
-//! item file names are rendered only in the page body.
+//! Page titles and headings are fixed strings, one per page type: that keeps
+//! the templates simple, and album names and item file names are rendered
+//! only in the page body.
 
 use crate::library::{ALBUM_NAME_PLACEHOLDER, Album, Item, MediaKind, Snapshot};
 use crate::pattern::Metadata;
@@ -12,7 +12,7 @@ use crate::routes;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 /// The placeholder holding the item's file name. Its chip is left out because
-/// the tile already shows the file name.
+/// the tile or page already shows the file name.
 const FILE_NAME_PLACEHOLDER: &str = "file_name";
 
 /// System defaults wherever possible: the page and form controls use the
@@ -41,7 +41,8 @@ a{color:inherit}button,input{font:inherit}img{display:block}
 .caption{position:absolute;inset:auto 0 0;padding:1.25rem .4rem .25rem;font-size:.7rem;color:#fff;background:linear-gradient(#0000,#0009);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .chips{display:flex;flex-wrap:wrap;gap:.3rem;margin:.4rem 0}.chip{font-size:.75rem;background:#8883;border-radius:999px;padding:.1rem .5rem}
 .sign-in{display:grid;gap:.75rem;max-width:20rem}.sign-in input{display:block;width:100%;box-sizing:border-box}
-.error{color:#b00020}.album-name{font-size:1.25rem;font-weight:600;margin:.25rem 0}
+.error{color:#b00020}.name{font-size:1.25rem;font-weight:600;margin:.25rem 0}
+.view img,.view video{display:block;max-width:100%;max-height:80vh;margin:.75rem auto}
 @media(prefers-color-scheme:dark){.error{color:#ff8a80}}
 ";
 
@@ -80,7 +81,7 @@ pub fn album_list(snapshot: &Snapshot) -> Markup {
                     a.album href=(routes::album_url(&album.id)) {
                         div.cover {
                             @if let Some(cover) = album.items.iter().find(|item| item.kind == MediaKind::Image) {
-                                img loading="lazy" src=(routes::item_url(&cover.id)) alt="";
+                                img loading="lazy" src=(routes::original_url(&cover.id)) alt="";
                             }
                         }
                         h2 { (album.name) }
@@ -101,7 +102,7 @@ pub fn album_detail(snapshot: &Snapshot, album: &Album) -> Markup {
         html! {
             (storage_notice(snapshot))
             p { a href=(routes::HOME) { "← All albums" } }
-            p.album-name { (album.name) }
+            p.name { (album.name) }
             (metadata_chips(&album.metadata, ALBUM_NAME_PLACEHOLDER))
             div.items {
                 @for item in &album.items {
@@ -129,18 +130,45 @@ fn item_count(count: usize) -> String {
     }
 }
 
-/// A square tile opening the item in a new tab, where the browser shows it
-/// (and plays videos) natively; its metadata is the tooltip. Browsers can't
-/// lazy-load `<video>`, so a video tile has none and nothing is fetched until
-/// it is opened.
+/// One item's page (title "Photo" or "Video"): the photo or the playable video,
+/// with a link opening its original in a new tab, for anything the browser
+/// can't show here.
+pub fn item_page(snapshot: &Snapshot, album: &Album, item: &Item) -> Markup {
+    let url = routes::original_url(&item.id);
+    let (title, media) = match item.kind {
+        MediaKind::Image => ("Photo", html! { img src=(url) alt=(item.file_name); }),
+        MediaKind::Video => (
+            "Video",
+            html! { video controls playsinline preload="metadata" { source src=(url); } },
+        ),
+    };
+    page(
+        title,
+        true,
+        html! {
+            (storage_notice(snapshot))
+            p { a href=(routes::album_url(&album.id)) { "← " (album.name) } }
+            div.top {
+                p.name { (item.file_name) }
+                a href=(url) target="_blank" { "Open original" }
+            }
+            (metadata_chips(&item.metadata, FILE_NAME_PLACEHOLDER))
+            div.view { (media) }
+        },
+    )
+}
+
+/// A square tile opening the item's page; its metadata is the tooltip.
+/// Browsers can't lazy-load `<video>`, so a video tile has none and nothing is
+/// fetched until it is opened.
 fn item_tile(item: &Item) -> Markup {
-    let url = routes::item_url(&item.id);
+    let url = routes::original_url(&item.id);
     let tooltip = std::iter::once(item.file_name.clone())
         .chain(metadata_labels(&item.metadata, FILE_NAME_PLACEHOLDER))
         .collect::<Vec<_>>()
         .join(" · ");
     html! {
-        a.tile href=(url) target="_blank" title=(tooltip) {
+        a.tile href=(routes::item_page_url(&item.id)) title=(tooltip) {
             @match item.kind {
                 MediaKind::Image => { img loading="lazy" src=(url) alt=""; }
                 // U+FE0E: a text glyph, never a colour emoji.

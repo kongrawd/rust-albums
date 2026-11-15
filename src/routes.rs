@@ -9,11 +9,14 @@ pub const SIGN_OUT: &str = "/logout";
 pub const HEALTH: &str = "/healthz";
 /// Router pattern matched by [`album_url`].
 pub const ALBUM: &str = "/albums/{album_id}";
-/// Router pattern matched by [`item_url`].
-pub const ITEM: &str = "/media/{item_id}";
+/// Router pattern matched by [`original_url`].
+pub const ORIGINAL: &str = "/media/{item_id}";
+/// Router pattern matched by [`item_page_url`]: the same link id as [`ORIGINAL`].
+pub const ITEM_PAGE: &str = "/items/{item_id}";
 
 const ALBUM_PREFIX: &str = "/albums/";
-const ITEM_PREFIX: &str = "/media/";
+const ORIGINAL_PREFIX: &str = "/media/";
+const ITEM_PAGE_PREFIX: &str = "/items/";
 
 /// Characters left unescaped when encoding (RFC 3986 "unreserved").
 const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
@@ -27,8 +30,13 @@ pub fn album_url(album_id: &str) -> String {
     format!("{ALBUM_PREFIX}{album_id}")
 }
 
-pub fn item_url(item_id: &str) -> String {
-    format!("{ITEM_PREFIX}{item_id}")
+pub fn original_url(item_id: &str) -> String {
+    format!("{ORIGINAL_PREFIX}{item_id}")
+}
+
+/// The page showing an item, as opposed to its original ([`original_url`]).
+pub fn item_page_url(item_id: &str) -> String {
+    format!("{ITEM_PAGE_PREFIX}{item_id}")
 }
 
 /// The sign-in form, set to return to `target` (a local URL) afterwards.
@@ -58,9 +66,11 @@ mod tests {
     #[test]
     fn builders_match_router_patterns() {
         assert!(ALBUM.starts_with(ALBUM_PREFIX));
-        assert!(ITEM.starts_with(ITEM_PREFIX));
+        assert!(ORIGINAL.starts_with(ORIGINAL_PREFIX));
+        assert!(ITEM_PAGE.starts_with(ITEM_PAGE_PREFIX));
         assert_eq!(album_url("q2bMf0-_x"), "/albums/q2bMf0-_x");
-        assert_eq!(item_url("q2bMf0-_x"), "/media/q2bMf0-_x");
+        assert_eq!(original_url("q2bMf0-_x"), "/media/q2bMf0-_x");
+        assert_eq!(item_page_url("q2bMf0-_x"), "/items/q2bMf0-_x");
         assert_eq!(
             sign_in_url("/albums/a?x=1"),
             "/login?next=%2Falbums%2Fa%3Fx%3D1"

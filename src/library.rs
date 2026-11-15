@@ -60,9 +60,16 @@ pub struct Library {
 pub struct Snapshot {
     pub albums: Arc<Vec<Album>>,
     pub storage: StorageState,
-    /// Item link id -> item path.
-    item_paths: Arc<HashMap<String, String>>,
+    /// Where each item sits in `albums`, by link id.
+    items_by_link_id: Arc<HashMap<String, ItemPosition>>,
     skipped: Skipped,
+}
+
+/// An item's place in a snapshot's albums, valid for that snapshot only.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ItemPosition {
+    album: usize,
+    item: usize,
 }
 
 /// Outcome of the latest scan. The reasons are generic on purpose: they are
@@ -179,7 +186,7 @@ impl Library {
             snapshot: RwLock::new(Arc::new(Snapshot {
                 albums: Arc::new(Vec::new()),
                 storage: StorageState::Unreadable,
-                item_paths: Arc::new(HashMap::new()),
+                items_by_link_id: Arc::new(HashMap::new()),
                 skipped: Skipped::default(),
             })),
         });
@@ -215,7 +222,8 @@ impl Library {
 
     /// The item path for an item link id, as of the last successful scan.
     pub fn item_path(&self, item_id: &str) -> Option<String> {
-        self.snapshot().item_paths.get(item_id).cloned()
+        let snapshot = self.snapshot();
+        snapshot.item(item_id).map(|(_, item)| item.path.clone())
     }
 
     /// Scans now (blocking I/O). On failure the previous albums and link ids
@@ -238,7 +246,7 @@ impl Library {
                     );
                 }
                 self.replace_snapshot(Snapshot {
-                    item_paths: Arc::new(index_items(&albums)),
+                    items_by_link_id: Arc::new(index_items(&albums)),
                     albums: Arc::new(albums),
                     storage: StorageState::Available,
                     skipped,
@@ -485,10 +493,18 @@ impl Snapshot {
         self.albums.iter().find(|album| album.id == id)
     }
 
+    /// The item with this link id and its album. Only link ids whose file is
+    /// served count: a link id shared by two items is refused for both.
+    pub fn item(&self, id: &str) -> Option<(&Album, &Item)> {
+        let position = self.items_by_link_id.get(id)?;
+        let album = self.albums.get(position.album)?;
+        Some((album, album.items.get(position.item)?))
+    }
+
     fn with_storage(&self, storage: StorageState) -> Self {
         Self {
             albums: self.albums.clone(),
-            item_paths: self.item_paths.clone(),
+            items_by_link_id: self.items_by_link_id.clone(),
             storage,
             skipped: self.skipped,
         }
@@ -543,13 +559,27 @@ fn refuse_shared_album_ids(albums: Vec<Album>) -> Vec<Album> {
         .collect()
 }
 
-/// Item link id -> item path, without shared link ids.
-fn index_items(albums: &[Album]) -> HashMap<String, String> {
-    let items = || albums.iter().flat_map(|album| &album.items);
-    let shared = shared_link_ids("item", items().map(|item| item.id.as_str()));
+/// Each item's position by link id, without shared link ids.
+fn index_items(albums: &[Album]) -> HashMap<String, ItemPosition> {
+    let items = || {
+        albums.iter().enumerate().flat_map(|(album_index, album)| {
+            album
+                .items
+                .iter()
+                .enumerate()
+                .map(move |(item_index, item)| {
+                    let position = ItemPosition {
+                        album: album_index,
+                        item: item_index,
+                    };
+                    (position, item)
+                })
+        })
+    };
+    let shared = shared_link_ids("item", items().map(|(_, item)| item.id.as_str()));
     items()
-        .filter(|item| !shared.contains(&item.id))
-        .map(|item| (item.id.clone(), item.path.clone()))
+        .filter(|(_, item)| !shared.contains(&item.id))
+        .map(|(position, item)| (item.id.clone(), position))
         .collect()
 }
 
@@ -642,7 +672,7 @@ mod tests {
         library.scan_now().unwrap();
         let again = library.snapshot();
         assert_eq!(ids(&again), ids(&first));
-        assert_eq!(again.item_paths, first.item_paths);
+        assert_eq!(again.items_by_link_id, first.items_by_link_id);
         assert_eq!(again.storage, first.storage);
     }
 
