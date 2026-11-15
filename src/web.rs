@@ -152,8 +152,10 @@ async fn sign_in(
     {
         Verdict::Valid => {}
         Verdict::Invalid => {
+            // A form error, not a 401: RFC 9110 §15.5.2 requires a challenge
+            // with every 401, and browsers must never get one.
             let page = html::sign_in_page(Some("Wrong username or password."), next);
-            return (StatusCode::UNAUTHORIZED, page).into_response();
+            return (StatusCode::UNPROCESSABLE_ENTITY, page).into_response();
         }
         Verdict::Throttled(wait) => {
             let page = html::sign_in_page(
@@ -406,7 +408,7 @@ mod tests {
         assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
 
         let response = sign_in_as(&app, MALLORY, "wrong", "/").await;
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         let response = sign_in_as(&app, ALICE, "pw", "/").await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -464,7 +466,7 @@ mod tests {
         let (_root, app, links) = app().await;
         assert_eq!(
             sign_in_as(&app, MALLORY, "guess", "/").await.status(),
-            StatusCode::UNAUTHORIZED
+            StatusCode::UNPROCESSABLE_ENTITY
         );
         let response = sign_in_as(&app, MALLORY, "guess", "/").await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -725,7 +727,8 @@ mod tests {
     /// Signed out, by kind of client. RFC 9110 §15.5.2: a 401 must carry a
     /// challenge, so only tools and desktop players, which can answer one, get
     /// a 401. Browsers must sign in on the page instead: they get the sign-in
-    /// redirect, or a 403 (§15.5.4) when loading an item.
+    /// redirect, or a 403 (§15.5.4) when loading an item, and a wrong password
+    /// there is a form error.
     #[tokio::test]
     async fn only_clients_that_can_answer_a_challenge_get_a_401() {
         let (_root, app, links) = app().await;
@@ -803,5 +806,19 @@ mod tests {
                 assert_eq!(body_text(response).await, "Sign in first", "{case}");
             }
         }
+
+        // A wrong password on the sign-in form shows the form again, still
+        // set to return to the album afterwards.
+        let next = links.album.replace('/', "%2F");
+        let response = sign_in_as(&app, MALLORY, "wrong", &next).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(header_of(&response, header::WWW_AUTHENTICATE), "");
+        assert_eq!(header_of(&response, header::LOCATION), "");
+        let page = body_text(response).await;
+        assert!(page.contains("Wrong username or password."), "{page}");
+        let form = format!(r#"action="{}""#, routes::SIGN_IN);
+        assert!(page.contains(&form), "{page}");
+        let return_to = format!(r#"value="{}""#, links.album);
+        assert!(page.contains(&return_to), "{page}");
     }
 }
