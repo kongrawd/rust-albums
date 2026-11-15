@@ -856,6 +856,8 @@ dependencies = [
  "axum-extra",
  "axum-server",
  "base64 0.22.1",
+ "hyper",
+ "hyper-util",
  "maud",
  "percent-encoding",
  "rcgen",

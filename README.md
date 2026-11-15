@@ -4,7 +4,7 @@ A small, self-hosted photo and video album viewer. Point it at a folder of photo
 
 - **Albums from folders:** you describe your folder layout with a pattern such as `{year}/{album_name}/{file_name}`, and each `{…}` part becomes metadata.
 - **Sign in, sign out:** one account, set in the environment. Signing out really signs you out, and every page and file link checks your session.
-- **HTTPS out of the box:** it creates a self-signed certificate on first run, or uses your own PEM files (e.g. from certbot).
+- **HTTPS out of the box:** it creates a self-signed certificate on first run, or uses your own PEM files (e.g. from certbot). Direct links without `https://` are redirected.
 - **Built for flaky storage:** USB disks and network shares can drop out; the albums stay visible and recover when the storage comes back.
 
 ## Quick start

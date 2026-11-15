@@ -10,10 +10,13 @@ axum = { version = "0.8", default-features = false, features = ["http1", "http2"
 axum-server = { version = "0.9", features = ["tls-rustls-no-provider"] }
 # Cookie and Basic-auth header parsing.
 axum-extra = { version = "0.12", default-features = false, features = ["cookie", "typed-header"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "time", "io-util"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tower-http = { version = "0.7", default-features = false, features = ["fs", "set-header"] }
 maud = { version = "0.27", features = ["axum"] }
+# The plain-HTTP answer on the HTTPS port (already in the tree via axum-server).
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 
 # TLS: rustls with the `ring` provider. No OpenSSL and no CMake (unlike aws-lc);
 # ring needs only a C compiler for the target, e.g. cargo-zigbuild when cross-compiling.
