@@ -6,6 +6,7 @@
 //! override it in containers. Credentials come from the environment only:
 //! `AUTH_USER`, `AUTH_PASS`. `rust-albums --healthcheck` checks a running server.
 
+mod access_log;
 mod auth;
 mod config;
 mod crypto;
@@ -30,6 +31,7 @@ pub struct App {
     pub credentials: auth::Credentials,
     pub sessions: Arc<session::Sessions>,
     pub hsts_max_age: Duration,
+    pub access_log: access_log::AccessLog,
 }
 
 /// Time given to in-flight requests on shutdown.
@@ -94,7 +96,7 @@ async fn serve(config: config::Config) -> Result<(), Box<dyn Error>> {
     let tls = tls::load_or_create(&config.tls)?;
     let addr = config.server.bind_addr;
 
-    println!(
+    eprintln!(
         "serving {} (pattern {}) on https://{addr} (TLS >= {:?})",
         config.storage.root.display(),
         config.storage.pattern,
@@ -108,6 +110,7 @@ async fn serve(config: config::Config) -> Result<(), Box<dyn Error>> {
         credentials,
         sessions,
         hsts_max_age: config.tls.hsts_max_age,
+        access_log: access_log::AccessLog::Stdout,
     }));
 
     let handle = Handle::new();
@@ -145,6 +148,6 @@ async fn shutdown_on_signal(handle: Handle<SocketAddr>) {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
-    println!("shutting down");
+    eprintln!("shutting down");
     handle.graceful_shutdown(Some(GRACEFUL_SHUTDOWN));
 }

@@ -2,7 +2,7 @@
 //! headers on every response.
 
 use crate::auth::{self, Verdict};
-use crate::{AppState, html, routes, session};
+use crate::{AppState, access_log, html, routes, session};
 use axum::{
     Extension, Form, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
@@ -99,6 +99,11 @@ pub fn router(state: AppState) -> Router {
         .layer(SetResponseHeaderLayer::overriding(
             header::STRICT_TRANSPORT_SECURITY,
             hsts(state.hsts_max_age),
+        ))
+        // Outermost, so it logs the final answer to every request.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            access_log::record,
         ))
         .with_state(state)
 }
@@ -245,7 +250,7 @@ mod tests {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// Size of the test video, `b.mp4`, in bytes.
     const VIDEO_LEN: usize = 64;
@@ -264,6 +269,12 @@ mod tests {
     /// photo `a.svg` and the video `b.mp4`. The
     /// `TempDir` deletes the files when dropped, even if the test panics.
     async fn app() -> (tempfile::TempDir, Router, Links) {
+        let (dir, router, links, _log) = app_with_log().await;
+        (dir, router, links)
+    }
+
+    /// [`app`], with its access log kept in memory.
+    async fn app_with_log() -> (tempfile::TempDir, Router, Links, access_log::Lines) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("storage");
         std::fs::create_dir_all(root.join("Trip")).unwrap();
@@ -287,6 +298,7 @@ mod tests {
             link_key: dir.path().join("link.key"),
         };
         let library = Library::open(&storage, link_ids).await.unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
         let router = router(Arc::new(App {
             library,
             credentials: Credentials::new("alice", "pw").unwrap(),
@@ -295,8 +307,9 @@ mod tests {
                 max_lifetime: Duration::from_secs(43200),
             })),
             hsts_max_age: Duration::from_secs(60),
+            access_log: access_log::AccessLog::Memory(log.clone()),
         }));
-        (dir, router, links)
+        (dir, router, links, log)
     }
 
     async fn send(app: &Router, request: Builder) -> Response {
@@ -839,5 +852,72 @@ mod tests {
         assert!(page.contains(&form), "{page}");
         let return_to = format!(r#"value="{}""#, links.album);
         assert!(page.contains(&return_to), "{page}");
+    }
+
+    /// One line per request in the Combined Log Format, with the client's
+    /// address and the final status. The query string is left out (it could
+    /// one day carry a token), and a user agent can't forge lines or fields.
+    #[tokio::test]
+    async fn requests_are_logged_in_combined_log_format() {
+        let (_root, app, links, log) = app_with_log().await;
+        let cookie = session_cookie(&app).await;
+        log.lock().unwrap().clear();
+
+        let player = play(&links.video, Some(&cookie))
+            .header(header::RANGE, "bytes=0-1")
+            .header(
+                header::USER_AGENT,
+                HeaderValue::from_bytes(b"Player \"x\"\t\xff\\").unwrap(),
+            );
+        send(&app, from(ALICE, player)).await;
+        let tool = Request::get(format!("{}?next=/secret", links.album))
+            .header(header::USER_AGENT, "Wget/1.24");
+        send(&app, from(MALLORY, tool)).await;
+        send(&app, from(ALICE, open("/", None))).await;
+        let head = Request::head(&links.photo)
+            .header(header::COOKIE, &cookie)
+            .header(header::USER_AGENT, "curl/8.7.1");
+        send(&app, from(ALICE, head)).await;
+        send(&app, from(ALICE, Request::get(routes::HEALTH))).await;
+
+        let expected = [
+            format!(
+                r#"192.168.1.10 - - [TIME] "GET {} HTTP/1.1" 206 2 "-" "Player \x22x\x22\x09\xff\x5c""#,
+                links.video
+            ),
+            format!(
+                r#"10.0.0.66 - - [TIME] "GET {} HTTP/1.1" 401 12 "-" "Wget/1.24""#,
+                links.album
+            ),
+            r#"192.168.1.10 - - [TIME] "GET / HTTP/1.1" 303 0 "-" "-""#.to_string(),
+            // A HEAD answer sends no body, whatever its `Content-Length` says.
+            format!(
+                r#"192.168.1.10 - - [TIME] "HEAD {} HTTP/1.1" 200 0 "-" "curl/8.7.1""#,
+                links.photo
+            ),
+        ];
+        let lines = log.lock().unwrap().clone();
+        // `/healthz` isn't logged: the container healthcheck would flood the log.
+        assert_eq!(lines.len(), expected.len(), "{lines:#?}");
+        for (line, expected) in lines.iter().zip(&expected) {
+            // `15/Nov/2026:20:19:04 +0000`: the time changes, its shape doesn't.
+            let start = line.find(" [").unwrap() + 2;
+            let time = line.get(start..start + 26).unwrap_or_default();
+            let shape: String = time
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_digit() {
+                        '9'
+                    } else if c.is_ascii_alphabetic() {
+                        'a'
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            assert_eq!(shape, "99/aaa/9999:99:99:99 +9999", "{line}");
+            assert!(time.ends_with(" +0000"), "UTC: {line}");
+            assert_eq!(&line.replacen(time, "TIME", 1), expected);
+        }
     }
 }
