@@ -1,4 +1,5 @@
 //! rust-albums: a minimal HTTPS-only album viewer over a local folder tree.
+//! Plain HTTP sent to the HTTPS port is answered by `plain_http`.
 //!
 //! Settings come from the local config file (`./albums.toml`, or `$ALBUMS_CONFIG`),
 //! created from `albums.default.toml` on first run; a few `ALBUMS_*` variables
@@ -13,6 +14,7 @@ mod html;
 mod library;
 mod link_ids;
 mod pattern;
+mod plain_http;
 mod routes;
 mod session;
 mod tls;
@@ -111,8 +113,11 @@ async fn serve(config: config::Config) -> Result<(), Box<dyn Error>> {
     let handle = Handle::new();
     tokio::spawn(shutdown_on_signal(handle.clone()));
     // TCP_NODELAY: small responses (e.g. 304s for an image grid) go out at
-    // once instead of waiting for more data.
-    let acceptor = RustlsAcceptor::new(tls).acceptor(NoDelayAcceptor::new());
+    // once instead of waiting for more data. Plain HTTP is answered before
+    // TLS (see `plain_http`).
+    let acceptor = plain_http::HttpsOnlyAcceptor::new(
+        RustlsAcceptor::new(tls).acceptor(NoDelayAcceptor::new()),
+    );
     let mut server = axum_server::bind(addr).acceptor(acceptor).handle(handle);
     server
         .http_builder()
