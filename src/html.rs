@@ -12,21 +12,37 @@ use crate::routes;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 /// The placeholder holding the item's file name. Its chip is left out because
-/// the caption already shows the file name.
+/// the tile already shows the file name.
 const FILE_NAME_PLACEHOLDER: &str = "file_name";
 
+/// System defaults wherever possible: the page and form controls use the
+/// browser's own colors (light or dark, per `color-scheme`) and the platform UI
+/// font. Controls keep their native look; only their font is set, as half-styled
+/// controls break (iOS draws submit buttons with white text on its own fill).
+/// The remaining colors are translucent, so they work on light and dark pages.
+///
+/// Albums and items are square tiles in as many columns as fit, never fewer
+/// than two albums or three items per row (the minimum width comes from
+/// `--gap`), so phones stay compact. Items run edge to edge on narrow screens.
 const STYLE: &str = "
-body{font-family:system-ui,sans-serif;margin:0 auto;max-width:1200px;padding:1rem;background:#fafafa;color:#222}
-a{color:inherit}.muted{color:#666;margin:.25rem 0}
-.grid{display:grid;gap:1rem;grid-template-columns:repeat(auto-fill,minmax(220px,1fr))}
-.card{display:block;background:#fff;border-radius:8px;padding:.5rem;box-shadow:0 1px 3px #0002;text-decoration:none;margin:0}
-.card h3{margin:.5rem 0 0}.cover{aspect-ratio:4/3;background:#eee;border-radius:6px;overflow:hidden}
-img,video{width:100%;display:block;border-radius:6px}.cover img{height:100%;object-fit:cover}
-figcaption{font-size:.85rem;margin-top:.4rem;word-break:break-all}
-.chips{display:flex;flex-wrap:wrap;gap:.3rem;margin:.4rem 0}.chip{font-size:.75rem;background:#e8eefc;border-radius:999px;padding:.1rem .5rem}
-.sign-out{float:right}button{font:inherit;padding:.4rem .9rem;border-radius:6px;border:1px solid #bbb;background:#fff;cursor:pointer}
-.sign-in{display:grid;gap:.75rem;max-width:20rem}.sign-in input{font:inherit;padding:.4rem;display:block;width:100%;box-sizing:border-box}
-.error{color:#b00020}.album-name{font-size:1.25rem;margin:.25rem 0}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Noto Sans',sans-serif,'Apple Color Emoji','Segoe UI Emoji','Noto Color Emoji';margin:0 auto;max-width:1400px;padding:1rem;overflow-wrap:anywhere}
+a{color:inherit}button,input{font:inherit}img{display:block}
+.top{display:flex;align-items:center;justify-content:space-between;gap:1rem}.top h1{margin:.25rem 0}
+.muted{opacity:.75;margin:0}
+.albums{--gap:.75rem;display:grid;gap:1rem var(--gap);grid-template-columns:repeat(auto-fill,minmax(min(9.5rem,calc((100% - var(--gap))/2)),1fr))}
+.album{text-decoration:none}.album h2{font-size:1rem;margin:.4rem 0 0}
+.cover{aspect-ratio:1;border-radius:10px;overflow:hidden;background:#8882}
+.cover img,.tile img{width:100%;height:100%;object-fit:cover}
+.items{--gap:2px;display:grid;gap:var(--gap);grid-template-columns:repeat(auto-fill,minmax(min(7.5rem,calc((100% - 2*var(--gap))/3)),1fr));margin:.75rem -1rem 0}
+@media(min-width:40rem){.items{--gap:4px;margin-inline:0}}
+.tile{position:relative;display:block;aspect-ratio:1;background:#8882;overflow:hidden;text-decoration:none}
+.play{position:absolute;inset:0;display:grid;place-items:center;font-size:1.5rem;opacity:.75}
+.caption{position:absolute;inset:auto 0 0;padding:1.25rem .4rem .25rem;font-size:.7rem;color:#fff;background:linear-gradient(#0000,#0009);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chips{display:flex;flex-wrap:wrap;gap:.3rem;margin:.4rem 0}.chip{font-size:.75rem;background:#8883;border-radius:999px;padding:.1rem .5rem}
+.sign-in{display:grid;gap:.75rem;max-width:20rem}.sign-in input{display:block;width:100%;box-sizing:border-box}
+.error{color:#b00020}.album-name{font-size:1.25rem;font-weight:600;margin:.25rem 0}
+@media(prefers-color-scheme:dark){.error{color:#ff8a80}}
 ";
 
 /// The sign-in page. `message` explains a failed attempt; `next` is where to
@@ -59,16 +75,16 @@ pub fn album_list(snapshot: &Snapshot) -> Markup {
             @if snapshot.albums.is_empty() {
                 p { "No albums found. Check the storage root and pattern." }
             }
-            div.grid {
+            div.albums {
                 @for album in snapshot.albums.iter() {
-                    a.card href=(routes::album_url(&album.id)) {
+                    a.album href=(routes::album_url(&album.id)) {
                         div.cover {
                             @if let Some(cover) = album.items.iter().find(|item| item.kind == MediaKind::Image) {
                                 img loading="lazy" src=(routes::item_url(&cover.id)) alt="";
                             }
                         }
-                        h3 { (album.name) }
-                        p.muted { (album.items.len()) " item(s)" }
+                        h2 { (album.name) }
+                        p.muted { (item_count(album.items.len())) }
                         (metadata_chips(&album.metadata, ALBUM_NAME_PLACEHOLDER))
                     }
                 }
@@ -87,15 +103,9 @@ pub fn album_detail(snapshot: &Snapshot, album: &Album) -> Markup {
             p { a href=(routes::HOME) { "← All albums" } }
             p.album-name { (album.name) }
             (metadata_chips(&album.metadata, ALBUM_NAME_PLACEHOLDER))
-            div.grid {
+            div.items {
                 @for item in &album.items {
-                    figure.card {
-                        (media_tag(item))
-                        figcaption {
-                            (item.file_name)
-                            (metadata_chips(&item.metadata, FILE_NAME_PLACEHOLDER))
-                        }
-                    }
+                    (item_tile(item))
                 }
             }
         },
@@ -112,30 +122,54 @@ fn storage_notice(snapshot: &Snapshot) -> Markup {
     }
 }
 
-fn media_tag(item: &Item) -> Markup {
+fn item_count(count: usize) -> String {
+    match count {
+        1 => "1 item".to_string(),
+        count => format!("{count} items"),
+    }
+}
+
+/// A square tile opening the item in a new tab, where the browser shows it
+/// (and plays videos) natively; its metadata is the tooltip. Browsers can't
+/// lazy-load `<video>`, so a video tile has none and nothing is fetched until
+/// it is opened.
+fn item_tile(item: &Item) -> Markup {
     let url = routes::item_url(&item.id);
+    let tooltip = std::iter::once(item.file_name.clone())
+        .chain(metadata_labels(&item.metadata, FILE_NAME_PLACEHOLDER))
+        .collect::<Vec<_>>()
+        .join(" · ");
     html! {
-        @match item.kind {
-            MediaKind::Image => a href=(url) target="_blank" {
-                img loading="lazy" src=(url) alt=(item.file_name);
-            },
-            MediaKind::Video => video controls preload="metadata" src=(url) {},
+        a.tile href=(url) target="_blank" title=(tooltip) {
+            @match item.kind {
+                MediaKind::Image => { img loading="lazy" src=(url) alt=""; }
+                // U+FE0E: a text glyph, never a colour emoji.
+                MediaKind::Video => span.play aria-hidden="true" { "▶\u{FE0E}" },
+            }
+            span.caption { (item.file_name) }
         }
     }
 }
 
-/// Metadata as chips, leaving out the `already_shown` placeholder (the album
-/// name or file name, which the page displays anyway).
-fn metadata_chips(metadata: &Metadata, already_shown: &str) -> Markup {
-    let chips: Vec<_> = metadata
+/// Metadata as `placeholder: value` labels, leaving out the `already_shown`
+/// placeholder (the album name or file name, which the page displays anyway).
+fn metadata_labels<'a>(
+    metadata: &'a Metadata,
+    already_shown: &'a str,
+) -> impl Iterator<Item = String> + 'a {
+    metadata
         .iter()
-        .filter(|(placeholder, _)| placeholder.as_str() != already_shown)
-        .collect();
+        .filter(move |(placeholder, _)| placeholder.as_str() != already_shown)
+        .map(|(placeholder, value)| format!("{placeholder}: {value}"))
+}
+
+fn metadata_chips(metadata: &Metadata, already_shown: &str) -> Markup {
+    let chips: Vec<_> = metadata_labels(metadata, already_shown).collect();
     html! {
         @if !chips.is_empty() {
             div.chips {
-                @for (placeholder, value) in chips {
-                    span.chip { (placeholder) ": " (value) }
+                @for chip in chips {
+                    span.chip { (chip) }
                 }
             }
         }
@@ -144,7 +178,7 @@ fn metadata_chips(metadata: &Metadata, already_shown: &str) -> Markup {
 
 /// The shared page layout. `title` is `'static` because titles are fixed per
 /// page type, never built from data; the same string is the page heading.
-/// Signed-in pages get the sign-out button.
+/// Signed-in pages get the sign-out button beside it.
 fn page(title: &'static str, signed_in: bool, body: Markup) -> Markup {
     html! {
         (DOCTYPE)
@@ -152,14 +186,17 @@ fn page(title: &'static str, signed_in: bool, body: Markup) -> Markup {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width,initial-scale=1";
+                meta name="color-scheme" content="light dark";
                 title { (title) }
                 style { (PreEscaped(STYLE)) }
             }
             body {
-                @if signed_in {
-                    (sign_out_button())
+                header.top {
+                    h1 { (title) }
+                    @if signed_in {
+                        (sign_out_button())
+                    }
                 }
-                h1 { (title) }
                 (body)
             }
         }
@@ -169,7 +206,7 @@ fn page(title: &'static str, signed_in: bool, body: Markup) -> Markup {
 /// Signing out must be a POST: a link (GET) could be triggered by any page.
 fn sign_out_button() -> Markup {
     html! {
-        form.sign-out method="post" action=(routes::SIGN_OUT) {
+        form method="post" action=(routes::SIGN_OUT) {
             button type="submit" { "Sign out" }
         }
     }

@@ -248,8 +248,8 @@ mod tests {
         item: String,
     }
 
-    /// A router over a temporary library with one album, `Trip`, holding one
-    /// item, `a.svg`. The
+    /// A router over a temporary library with one album, `Trip`, holding the
+    /// items `a.svg` and `b.mp4`. The
     /// `TempDir` deletes the files when dropped, even if the test panics.
     async fn app() -> (tempfile::TempDir, Router, Links) {
         let dir = tempfile::tempdir().unwrap();
@@ -257,6 +257,7 @@ mod tests {
         std::fs::create_dir_all(root.join("Trip")).unwrap();
         std::fs::write(root.join(".albums-root"), "").unwrap();
         std::fs::write(root.join("Trip/a.svg"), "<svg/>").unwrap();
+        std::fs::write(root.join("Trip/b.mp4"), "").unwrap();
         let link_ids = LinkIds::load_or_create(&dir.path().join("link.key")).unwrap();
         let links = Links {
             album: routes::album_url(&link_ids.album("Trip")),
@@ -517,6 +518,20 @@ mod tests {
             let response = sign_in_as(&app, ALICE, "pw", hostile).await;
             assert_eq!(header_of(&response, header::LOCATION), "/", "{hostile}");
         }
+    }
+
+    #[tokio::test]
+    async fn album_pages_fetch_media_only_when_needed() {
+        let (_root, app, links) = app().await;
+        let cookie = session_cookie(&app).await;
+        let html = body_text(send(&app, open(&links.album, Some(&cookie))).await).await;
+        assert!(html.contains(&format!(r#"loading="lazy" src="{}""#, links.item)));
+        // Browsers can't lazy-load `<video>`, so video tiles have none.
+        assert!(!html.contains("<video"), "{html}");
+        assert!(
+            html.contains("b.mp4"),
+            "the file name is shown, not only a tooltip"
+        );
     }
 
     #[tokio::test]

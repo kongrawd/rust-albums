@@ -24,6 +24,7 @@ use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
+use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 /// A scan taking longer than this marks storage unavailable (hung mount).
@@ -110,7 +111,8 @@ struct ScanError {
 pub struct Album {
     /// Link id, used in URLs.
     pub id: String,
-    /// The `{album_name}` placeholder, else the album's folder name.
+    /// The `{album_name}` placeholder, else the album's folder name; composed
+    /// for display like all names and metadata (see [`composed`]).
     pub name: String,
     pub metadata: Metadata,
     pub items: Vec<Item>,
@@ -121,8 +123,8 @@ pub struct Item {
     pub id: String,
     /// Item path, e.g. `year=2024/Lake Trip/001_dock.jpg`.
     pub path: String,
-    /// The whole name on disk, e.g. `001_dock.jpg`; a `{file_name}`
-    /// placeholder may capture only part of it.
+    /// The whole name, e.g. `001_dock.jpg`, composed for display; a
+    /// `{file_name}` placeholder may capture only part of it.
     pub file_name: String,
     pub kind: MediaKind,
     pub metadata: Metadata,
@@ -402,23 +404,25 @@ impl Library {
             let (folders, last) = segments.split_at(segments.len() - 1);
             let file_name = last[0];
             let album_path = folders.join("/");
-            let album = albums.entry(album_path.clone()).or_insert_with(|| Album {
-                id: self.link_ids.album(&album_path),
-                name: captured
-                    .album_metadata
-                    .get(ALBUM_NAME_PLACEHOLDER)
-                    .map_or(folders[folders.len() - 1], String::as_str)
-                    .to_string(),
-                metadata: captured.album_metadata,
-                items: Vec::new(),
+            let album = albums.entry(album_path.clone()).or_insert_with(|| {
+                let metadata = composed_metadata(captured.album_metadata);
+                Album {
+                    id: self.link_ids.album(&album_path),
+                    name: metadata
+                        .get(ALBUM_NAME_PLACEHOLDER)
+                        .cloned()
+                        .unwrap_or_else(|| composed(folders[folders.len() - 1])),
+                    metadata,
+                    items: Vec::new(),
+                }
             });
             let item_path = segments.join("/");
             album.items.push(Item {
                 id: self.link_ids.item(&item_path),
                 path: item_path,
-                file_name: file_name.to_string(),
+                file_name: composed(file_name),
                 kind,
-                metadata: captured.item_metadata,
+                metadata: composed_metadata(captured.item_metadata),
             });
         }
         // The mount may have dropped mid-walk, leaving only part of the root.
@@ -515,6 +519,20 @@ fn shared_link_ids<'a>(kind: &str, ids: impl Iterator<Item = &'a str>) -> HashSe
         eprintln!("{kind} link id {id} is shared by several {kind}s; they are refused");
     }
     shared
+}
+
+/// A name as shown on the pages: composed (NFC), as macOS and SMB clients often
+/// write names decomposed (`e` plus a combining accent), which some fonts draw
+/// misplaced. Item paths keep the name as on disk, so files still open.
+fn composed(name: &str) -> String {
+    name.nfc().collect()
+}
+
+fn composed_metadata(metadata: Metadata) -> Metadata {
+    metadata
+        .into_iter()
+        .map(|(placeholder, value)| (placeholder, composed(&value)))
+        .collect()
 }
 
 fn refuse_shared_album_ids(albums: Vec<Album>) -> Vec<Album> {
@@ -644,6 +662,27 @@ mod tests {
         assert_eq!(item.file_name, "001_a.svg");
         assert_eq!(item.metadata["seq"], "001");
         assert_eq!(item.metadata["file_name"], "a.svg");
+    }
+
+    /// macOS and SMB clients often write names decomposed (NFD): `e` plus a
+    /// combining accent, which some fonts draw misplaced.
+    #[tokio::test]
+    async fn names_are_shown_composed_but_paths_stay_as_on_disk() {
+        let base = tempfile::tempdir().unwrap();
+        let album = base.path().join("Cafe\u{301}");
+        fs::create_dir_all(&album).unwrap();
+        fs::write(base.path().join(".albums-root"), "").unwrap();
+        fs::write(album.join("cre\u{300}me.svg"), "x").unwrap();
+        let pattern = "{album_name}/{file_name}";
+        let library = library(base.path(), &settings(base.path(), pattern)).await;
+        let albums = library.snapshot().albums.clone();
+        assert_eq!(albums[0].name, "Caf\u{e9}");
+        assert_eq!(albums[0].metadata["album_name"], "Caf\u{e9}");
+        let item = &albums[0].items[0];
+        assert_eq!(item.file_name, "cr\u{e8}me.svg");
+        assert_eq!(item.metadata["file_name"], "cr\u{e8}me.svg");
+        assert_eq!(item.path, "Cafe\u{301}/cre\u{300}me.svg");
+        assert!(library.item_file(&item.path).await.is_some());
     }
 
     #[tokio::test]
