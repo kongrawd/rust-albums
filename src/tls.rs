@@ -17,6 +17,9 @@
 use crate::config::{self, TlsVersion};
 use crate::crypto;
 use axum_server::tls_rustls::RustlsConfig;
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair, SerialNumber,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use rustls::{ServerConfig, version};
 use std::fs;
@@ -24,6 +27,16 @@ use std::io::{self, ErrorKind};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// First year the generated certificate is valid. Before 2019-07-01, so
+/// Apple's 825-day limit for certificates issued after that date doesn't
+/// apply (see [`self_signed_params`]).
+const SELF_SIGNED_VALID_FROM_YEAR: i32 = 1975;
+/// Year the generated certificate expires: never in practice, since it is
+/// never renewed.
+const SELF_SIGNED_VALID_UNTIL_YEAR: i32 = 4096;
+/// Length of the generated certificate's random serial number.
+const SERIAL_BYTES: usize = 16;
 
 /// Outcome of trying to generate a self-signed pair.
 enum Generation {
@@ -129,9 +142,41 @@ fn access_error(path: &Path, err: &io::Error) -> String {
     }
 }
 
+/// The generated certificate, set explicitly rather than left to rcgen's
+/// defaults, so that browsers on every platform let you accept it:
+///
+/// - Names only in the subjectAltName: Chrome and Apple ignore the CommonName.
+/// - The serverAuth extended key usage, which Apple requires.
+/// - Valid from [`SELF_SIGNED_VALID_FROM_YEAR`] to
+///   [`SELF_SIGNED_VALID_UNTIL_YEAR`]. Apple refuses a certificate issued
+///   (NotBefore) after 2019-07-01 that is valid for more than 825 days, an
+///   error Chrome on macOS shows as "revoked" with no way to proceed. It is
+///   never renewed, so one long-lived certificate also keeps the browser's
+///   exception.
+/// - A random serial: Firefox refuses, with no way to proceed, a regenerated
+///   certificate whose issuer and serial match one it already accepted.
+fn self_signed_params(names: &[String]) -> Result<CertificateParams, String> {
+    let mut params = CertificateParams::new(names.to_vec())
+        .map_err(|e| format!("TLS: self-signed certificate names {names:?}: {e}"))?;
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "rust-albums self-signed");
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.not_before = rcgen::date_time_ymd(SELF_SIGNED_VALID_FROM_YEAR, 1, 1);
+    params.not_after = rcgen::date_time_ymd(SELF_SIGNED_VALID_UNTIL_YEAR, 1, 1);
+    let mut serial = crypto::random::<SERIAL_BYTES>();
+    serial[0] &= 0x7f; // positive
+    params.serial_number = Some(SerialNumber::from_slice(&serial));
+    Ok(params)
+}
+
 fn create_self_signed(settings: &config::Tls) -> Result<Generation, String> {
-    let generated = rcgen::generate_simple_self_signed(settings.self_signed_names.clone())
-        .map_err(|e| format!("TLS: generating a self-signed certificate: {e}"))?;
+    let generation_error =
+        |e: rcgen::Error| format!("TLS: generating a self-signed certificate: {e}");
+    let params = self_signed_params(&settings.self_signed_names)?;
+    let signing_key = KeyPair::generate().map_err(generation_error)?;
+    let cert = params.self_signed(&signing_key).map_err(generation_error)?;
     let write_error = |path: &Path, err: io::Error| {
         let hint = if err.kind() == ErrorKind::ReadOnlyFilesystem {
             " (read-only mount: provide a certificate and key, or make the folder writable)"
@@ -140,7 +185,7 @@ fn create_self_signed(settings: &config::Tls) -> Result<Generation, String> {
         };
         format!("TLS: writing {}: {err}{hint}", path.display())
     };
-    let key_pem = generated.signing_key.serialize_pem();
+    let key_pem = signing_key.serialize_pem();
     match crypto::create_secret_file(&settings.key, key_pem.as_bytes()) {
         Ok(()) => {}
         Err(err) if err.kind() == ErrorKind::AlreadyExists => {
@@ -149,8 +194,7 @@ fn create_self_signed(settings: &config::Tls) -> Result<Generation, String> {
         Err(err) => return Err(write_error(&settings.key, err)),
     }
     // Written atomically, so it is never read half-written.
-    if let Err(err) = crypto::write_file_atomically(&settings.cert, generated.cert.pem().as_bytes())
-    {
+    if let Err(err) = crypto::write_file_atomically(&settings.cert, cert.pem().as_bytes()) {
         // Undo, so the next start can generate again instead of finding a lone key.
         let _ = fs::remove_file(&settings.key);
         return Err(write_error(&settings.cert, err));
@@ -182,6 +226,29 @@ mod tests {
 
     fn install_provider() {
         let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    #[test]
+    fn generated_certificates_follow_browser_rules() {
+        let names = vec!["albums.local".to_string(), "192.168.1.20".to_string()];
+        let params = self_signed_params(&names).unwrap();
+        assert!(
+            params.not_before < rcgen::date_time_ymd(2019, 7, 1),
+            "Apple limits certificates issued after 2019-07-01 to 825 days"
+        );
+        assert_eq!(
+            params.extended_key_usages,
+            [ExtendedKeyUsagePurpose::ServerAuth]
+        );
+        assert!(matches!(
+            params.subject_alt_names[1],
+            rcgen::SanType::IpAddress(_)
+        ));
+        let again = self_signed_params(&names).unwrap();
+        assert_ne!(
+            again.serial_number, params.serial_number,
+            "Firefox refuses a reused serial"
+        );
     }
 
     #[test]

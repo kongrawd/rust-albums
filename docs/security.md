@@ -3,6 +3,7 @@
 ## HTTPS only
 
 - There is no plain-HTTP port, so nothing is ever served unencrypted. TLS 1.3 is the minimum by default (`tls.min_version`).
+- The self-signed certificate is made so that every major browser lets you accept it.
 - Browsers are told to use HTTPS only for this host (HSTS). They only honour that for a host name with a trusted certificate, so with the default self-signed certificate on `localhost` or an IP it has no effect; there, the missing HTTP port is what enforces HTTPS.
 - Pages run no scripts and can't be framed by other sites, and files open in a sandbox.
 
