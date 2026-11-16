@@ -1,0 +1,7 @@
+# Child processes start in one place only, `thumbnail::child`, which hands them
+# a read-only file and an empty environment. Other uses need an #[expect].
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "children start only in thumbnail::child" },
+    { path = "tokio::process::Command::new", reason = "children start only in thumbnail::child" },
+    { path = "std::env::current_exe", reason = "children start from /proc/self/exe where it exists; see thumbnail::child" },
+]

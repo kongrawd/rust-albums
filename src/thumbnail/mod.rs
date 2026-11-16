@@ -1,8 +1,12 @@
 //! Thumbnails: small JPEGs shown in album grids instead of loading originals.
+//! Videos are decoded in a child process (see [`child`]), so a bug in a
+//! decoder aborts that process, never the server.
 
 // Wired into the server by the thumbnail route; until then only tests use it.
 #![allow(dead_code)]
 
+#[cfg(unix)]
+pub mod child;
 mod jpeg;
 pub mod mp4;
 pub mod picture;

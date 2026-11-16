@@ -4,7 +4,10 @@
 //! Settings come from the local config file (`./albums.toml`, or `$ALBUMS_CONFIG`),
 //! created from `albums.default.toml` on first run; a few `ALBUMS_*` variables
 //! override it in containers. Credentials come from the environment only:
-//! `AUTH_USER`, `AUTH_PASS`. `rust-albums --healthcheck` checks a running server.
+//! `AUTH_USER`, `AUTH_PASS`. `rust-albums --healthcheck` checks a running server;
+//! `rust-albums --thumbnail` is the child process the server decodes videos in.
+
+#![forbid(unsafe_code)]
 
 mod access_log;
 mod auth;
@@ -57,6 +60,13 @@ fn env_required(name: &str) -> Result<String, String> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    #[cfg(unix)]
+    if env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--thumbnail")
+    {
+        std::process::exit(thumbnail::child::run());
+    }
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| "failed to install the rustls ring crypto provider")?;
