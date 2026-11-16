@@ -12,7 +12,8 @@ axum-server = { version = "0.9", features = ["tls-rustls-no-provider"] }
 axum-extra = { version = "0.12", default-features = false, features = ["cookie", "typed-header"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "time", "io-util"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
-tower-http = { version = "0.7", default-features = false, features = ["fs", "set-header"] }
+# Gzip only: brotli would add about 1 MB to the binary for a few percent smaller pages.
+tower-http = { version = "0.7", default-features = false, features = ["fs", "set-header", "compression-gzip"] }
 maud = { version = "0.27", features = ["axum"] }
 # The plain-HTTP answer on the HTTPS port (already in the tree via axum-server).
 hyper = { version = "1", default-features = false, features = ["http1", "server"] }
@@ -46,6 +47,8 @@ strip = true
 
 [dev-dependencies]
 tempfile = "3"
+# Reads gzipped pages back (already in the tree via tower-http's compression).
+flate2 = "1"
 tokio = { version = "1", features = ["test-util"] }
 
 [lints.clippy]

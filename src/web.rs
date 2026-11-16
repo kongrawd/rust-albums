@@ -17,6 +17,7 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tower::ServiceExt;
+use tower_http::compression::{CompressionLayer, CompressionLevel};
 use tower_http::{services::ServeFile, set_header::SetResponseHeaderLayer};
 
 /// Pages run no scripts and load nothing but images and videos from this
@@ -63,6 +64,10 @@ const CROSS_ORIGIN_RESOURCE_POLICY: HeaderName =
 ///   path gets a plain 404 instead of a sign-in redirect.
 /// - The cross-site check wraps the page and original headers, so its 403 carries
 ///   only the headers every response gets (nosniff, CORP and HSTS).
+/// - Only pages are gzipped, at the fastest level: a large album page shrinks
+///   about sevenfold for a few milliseconds. Originals are compressed already,
+///   and gzipping a video would break the ranges it is played from. No secret
+///   is ever in a page body, which is what a compression attack (BREACH) needs.
 pub fn router(state: AppState) -> Router {
     let sign_in_required = middleware::from_fn_with_state(state.clone(), auth::require_sign_in);
 
@@ -77,7 +82,8 @@ pub fn router(state: AppState) -> Router {
     let pages = sign_in_pages
         .merge(album_pages)
         .layer(set_header(header::CONTENT_SECURITY_POLICY, PAGE_CSP))
-        .layer(set_header(header::CACHE_CONTROL, NO_STORE));
+        .layer(set_header(header::CACHE_CONTROL, NO_STORE))
+        .layer(CompressionLayer::new().quality(CompressionLevel::Fastest));
 
     let originals = Router::new()
         .route(routes::ORIGINAL, get(serve_original))
@@ -740,6 +746,57 @@ mod tests {
                 content_type,
                 "{url}"
             );
+        }
+    }
+
+    /// Pages are gzipped for browsers that accept it (a large album page
+    /// shrinks about sevenfold). Originals never are: they are compressed
+    /// already, and videos are fetched in ranges. A gzipped page's size isn't
+    /// known up front, so its log line shows `-`.
+    #[tokio::test]
+    async fn pages_are_gzipped_but_originals_never() {
+        use std::io::Read;
+        let (_root, app, links, log) = app_with_log().await;
+        let cookie = session_cookie(&app).await;
+        let gzip = |request: Builder| request.header(header::ACCEPT_ENCODING, "gzip");
+        for (page, cookie) in [
+            (links.album.as_str(), Some(cookie.as_str())),
+            (routes::SIGN_IN, None),
+        ] {
+            let plain = body_text(send(&app, open(page, cookie)).await).await;
+            let response = send(&app, gzip(open(page, cookie))).await;
+            assert_eq!(response.status(), StatusCode::OK, "{page}");
+            assert_eq!(
+                header_of(&response, header::CONTENT_ENCODING),
+                "gzip",
+                "{page}"
+            );
+            assert_eq!(
+                header_of(&response, header::VARY),
+                "accept-encoding",
+                "{page}"
+            );
+            let line = log.lock().unwrap().last().cloned().unwrap();
+            assert!(line.contains(" 200 - "), "{line}");
+            let gzipped = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let mut html = String::new();
+            flate2::read::GzDecoder::new(&gzipped[..])
+                .read_to_string(&mut html)
+                .unwrap();
+            assert_eq!(html, plain, "{page}");
+        }
+
+        let range = play(&links.video, Some(&cookie)).header(header::RANGE, "bytes=0-1");
+        for (request, status) in [
+            (open(&links.photo, Some(&cookie)), StatusCode::OK),
+            (open(&links.video, Some(&cookie)), StatusCode::OK),
+            (range, StatusCode::PARTIAL_CONTENT),
+        ] {
+            let response = send(&app, gzip(request)).await;
+            assert_eq!(response.status(), status);
+            assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
         }
     }
 
