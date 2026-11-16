@@ -38,12 +38,26 @@ serde = { version = "1", features = ["derive"] }
 toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
 # Access-log timestamps (already in the tree via cookie and rcgen).
 time = { version = "0.3", default-features = false, features = ["std"] }
+# Video thumbnails: pure-Rust H.264 and HEVC decoders with no dependencies of
+# their own, pinned exactly as they are young; one keyframe per video is decoded.
+# rust_h264's dev-internals only makes some of its modules public (sps, pps,
+# slice, sha256); its SPS parser is used to check picture sizes, as it has no
+# size limit of its own.
+rust_h264 = { version = "=0.6.1", default-features = false, features = ["std", "dev-internals"] }
+rust_h265 = "=0.4.1"
 
 [profile.release]
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The video decoders are far too slow unoptimised, so tests optimise them.
+[profile.dev.package.rust_h264]
+opt-level = 3
+
+[profile.dev.package.rust_h265]
+opt-level = 3
 
 [dev-dependencies]
 tempfile = "3"

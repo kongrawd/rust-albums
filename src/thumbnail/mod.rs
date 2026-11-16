@@ -6,6 +6,7 @@
 mod jpeg;
 pub mod mp4;
 pub mod picture;
+pub mod video;
 
 use std::{fmt, io};
 
@@ -39,6 +40,10 @@ pub enum Reason {
     PictureTooLarge,
     NoKeyframe,
     KeyframeTooLarge,
+    /// Chroma other than 4:2:0.
+    Chroma,
+    /// Chroma stored at another bit depth than luma.
+    BitDepths,
 }
 
 impl fmt::Display for Reason {
@@ -52,6 +57,8 @@ impl fmt::Display for Reason {
             Self::PictureTooLarge => "picture too large",
             Self::NoKeyframe => "no keyframe",
             Self::KeyframeTooLarge => "keyframe too large",
+            Self::Chroma => "only 4:2:0 video is supported",
+            Self::BitDepths => "chroma and luma bit depths differ",
         })
     }
 }
