@@ -8,8 +8,9 @@
 
 use crate::library::{ALBUM_NAME_PLACEHOLDER, Album, Item, MediaKind, Snapshot};
 use crate::pattern::Metadata;
-use crate::routes;
-use maud::{DOCTYPE, Markup, PreEscaped, html};
+use crate::{routes, thumbnail};
+use maud::{DOCTYPE, Escaper, Markup, PreEscaped, Render, html};
+use std::fmt::{self, Write as _};
 
 /// The placeholder holding the item's file name. Its chip is left out because
 /// the tile or page already shows the file name.
@@ -80,8 +81,8 @@ pub fn album_list(snapshot: &Snapshot) -> Markup {
                 @for album in snapshot.albums.iter() {
                     a.album href=(routes::album_url(&album.id)) {
                         div.cover {
-                            @if let Some(cover) = album.items.iter().find(|item| item.kind == MediaKind::Image) {
-                                img loading="lazy" src=(routes::original_url(&cover.id)) alt="";
+                            @if let Some(cover) = album.items.iter().find_map(preview) {
+                                img loading="lazy" src=(cover) alt="";
                             }
                         }
                         h2 { (album.name) }
@@ -158,37 +159,74 @@ pub fn item_page(snapshot: &Snapshot, album: &Album, item: &Item) -> Markup {
     )
 }
 
-/// A square tile opening the item's page; its metadata is the tooltip.
-/// Browsers can't lazy-load `<video>`, so a video tile has none and nothing is
-/// fetched until it is opened.
+/// A square tile opening the item's page, showing its [`preview`] (a video's
+/// with a play glyph over it); its metadata is the tooltip.
 fn item_tile(item: &Item) -> Markup {
-    let url = routes::original_url(&item.id);
-    let tooltip = std::iter::once(item.file_name.clone())
-        .chain(metadata_labels(&item.metadata, FILE_NAME_PLACEHOLDER))
-        .collect::<Vec<_>>()
-        .join(" · ");
     html! {
-        a.tile href=(routes::item_page_url(&item.id)) title=(tooltip) {
-            @match item.kind {
-                MediaKind::Image => { img loading="lazy" src=(url) alt=""; }
+        a.tile href=(routes::item_page_url(&item.id)) title=(Tooltip(item)) {
+            @if let Some(src) = preview(item) {
+                img loading="lazy" src=(src) alt="";
+            }
+            @if item.kind == MediaKind::Video {
                 // U+FE0E: a text glyph, never a colour emoji.
-                MediaKind::Video => span.play aria-hidden="true" { "▶\u{FE0E}" },
+                span.play aria-hidden="true" { "▶\u{FE0E}" }
             }
             span.caption { (item.file_name) }
         }
     }
 }
 
-/// Metadata as `placeholder: value` labels, leaving out the `already_shown`
-/// placeholder (the album name or file name, which the page displays anyway).
+/// The URL of the image that tiles and album covers show for `item`, the one
+/// place deciding it (a video tile adds its play glyph on its own). A photo
+/// shows its original; a video its thumbnail, if it has one: never the video,
+/// as browsers can't lazy-load `<video>`.
+fn preview(item: &Item) -> Option<routes::Link<'_>> {
+    match item.kind {
+        MediaKind::Image => Some(routes::original_url(&item.id)),
+        MediaKind::Video if thumbnail::has_thumbnail(&item.path) => {
+            Some(routes::thumbnail_url(&item.id))
+        }
+        MediaKind::Video => None,
+    }
+}
+
+/// A tile's tooltip: the file name, then its metadata labels. Written straight
+/// into the page, escaped, so a grid builds no `String` per tile.
+struct Tooltip<'a>(&'a Item);
+
+impl Render for Tooltip<'_> {
+    fn render_to(&self, buffer: &mut String) {
+        let mut tooltip = Escaper::new(buffer);
+        let written = tooltip.write_str(&self.0.file_name).and_then(|()| {
+            metadata_labels(&self.0.metadata, FILE_NAME_PLACEHOLDER)
+                .try_for_each(|label| write!(tooltip, " · {label}"))
+        });
+        written.expect("writing to a String can't fail");
+    }
+}
+
+/// A metadata value as chips and tooltips show it: `placeholder: value`.
+struct Label<'a> {
+    placeholder: &'a str,
+    value: &'a str,
+}
+
+impl fmt::Display for Label<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.placeholder, self.value)
+    }
+}
+
+/// The metadata's labels, leaving out the `already_shown` placeholder (the
+/// album name or file name, which the page displays anyway).
 fn metadata_labels<'a>(
     metadata: &'a Metadata,
     already_shown: &'a str,
-) -> impl Iterator<Item = String> + 'a {
+) -> impl Iterator<Item = Label<'a>> + 'a {
     metadata
         .iter()
         .filter(move |(placeholder, _)| placeholder.as_str() != already_shown)
-        .map(|(placeholder, value)| format!("{placeholder}: {value}"))
+        .map(|(placeholder, value)| Label { placeholder, value })
 }
 
 fn metadata_chips(metadata: &Metadata, already_shown: &str) -> Markup {

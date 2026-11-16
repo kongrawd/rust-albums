@@ -99,7 +99,7 @@ fn clf_time(now: OffsetDateTime) -> String {
 }
 
 /// Printable ASCII as is; `"`, `\` and every other byte as `\xHH`.
-fn escape(bytes: &[u8]) -> String {
+pub fn escape(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len());
     for &byte in bytes {
         match byte {

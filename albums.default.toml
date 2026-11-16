@@ -54,3 +54,10 @@ hsts_max_age_secs = 31536000
 idle_timeout_secs = 1800
 # ...and at the latest this long after signing in, however active (12 h).
 max_lifetime_secs = 43200
+
+[thumbnails]
+# Where video thumbnails are kept. Safe to delete: missing ones are made again.
+dir = "./thumbnails"
+# Thumbnails are made in a sandbox. Kernels without Landlock (Raspberry Pi OS,
+# for one) make none unless this is true, which makes them unsandboxed.
+allow_unconfined = false

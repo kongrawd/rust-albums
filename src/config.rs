@@ -1,10 +1,13 @@
 //! Settings from the local config file (TOML). Defaults live in
 //! `albums.default.toml`, which is embedded in the binary and copied to the
-//! config path on first run. Unknown keys are rejected to catch typos. A few
-//! `ALBUMS_*` environment variables override the file, for containers.
+//! config path on first run. Settings missing from the file, such as those
+//! added since an older version wrote it, take their defaults. Unknown keys are
+//! rejected to catch typos. A few `ALBUMS_*` environment variables override the
+//! file, for containers.
 
 use crate::crypto;
 use crate::pattern::Pattern;
+use serde::de::IntoDeserializer;
 use serde::{Deserialize, Deserializer};
 use std::fmt::Display;
 use std::fs;
@@ -12,6 +15,7 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use toml::de::{DeTable, DeValue};
 
 /// Where the config file is when `$ALBUMS_CONFIG` isn't set.
 const DEFAULT_CONFIG_PATH: &str = "./albums.toml";
@@ -25,6 +29,7 @@ pub struct Config {
     pub storage: Storage,
     pub tls: Tls,
     pub session: Session,
+    pub thumbnails: Thumbnails,
 }
 
 #[derive(Deserialize)]
@@ -78,6 +83,15 @@ pub struct Session {
     pub max_lifetime: Duration,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Thumbnails {
+    /// Where thumbnails are cached; anything in it can be made again.
+    pub dir: PathBuf,
+    /// Whether children may decode unconfined where the sandbox can't be had.
+    pub allow_unconfined: bool,
+}
+
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TlsVersion {
     #[serde(rename = "1.2")]
@@ -100,6 +114,27 @@ fn config_file_exists(path: &Path) -> Result<bool, String> {
             _ => Ok(false),
         },
         Err(err) => Err(err.to_string()),
+    }
+}
+
+/// Adds to `file` every setting of `defaults` it lacks; tables (the
+/// `[sections]`) are filled key by key, and the file's own values always win.
+/// Those keep their place in the file, so an error about one points at its
+/// line. Filled-in defaults never cause errors: the default config is valid.
+fn fill_defaults<'i>(file: &mut DeTable<'i>, defaults: DeTable<'i>) {
+    for (key, default) in defaults {
+        match file.get_mut(&key) {
+            None => {
+                file.insert(key, default);
+            }
+            Some(value) => {
+                if let (DeValue::Table(table), DeValue::Table(default)) =
+                    (value.get_mut(), default.into_inner())
+                {
+                    fill_defaults(table, default);
+                }
+            }
+        }
     }
 }
 
@@ -129,7 +164,7 @@ impl Config {
             eprintln!("wrote default config -> {}", path.display());
         }
         let text = fs::read_to_string(path).map_err(|e| describe(&e))?;
-        let mut config: Self = toml::from_str(&text).map_err(|e| describe(&e))?;
+        let mut config = Self::parse(&text).map_err(|e| describe(&e))?;
         config.apply_overrides(|name| std::env::var(name).ok())?;
         config.validate().map_err(|e| describe(&e))?;
         // A config in the working directory needs no rewriting.
@@ -140,6 +175,20 @@ impl Config {
             config.resolve_relative_paths(dir);
         }
         Ok(config)
+    }
+
+    /// The settings in `text`, with the defaults for those it lacks. Every
+    /// error, from a syntax error to a typo or a wrong type, points at its line
+    /// in `text`.
+    fn parse(text: &str) -> Result<Self, toml::de::Error> {
+        let mut file = DeTable::parse(text)?;
+        let defaults =
+            DeTable::parse(DEFAULT_CONFIG_TOML).expect("albums.default.toml is valid TOML");
+        fill_defaults(file.get_mut(), defaults.into_inner());
+        Self::deserialize(file.into_deserializer()).map_err(|mut error| {
+            error.set_input(Some(text));
+            error
+        })
     }
 
     /// Container-friendly overrides; `lookup` is `std::env::var` outside tests.
@@ -203,6 +252,7 @@ impl Config {
             &mut self.storage.link_key,
             &mut self.tls.cert,
             &mut self.tls.key,
+            &mut self.thumbnails.dir,
         ] {
             if path.is_relative() {
                 let relative = path.strip_prefix(".").unwrap_or(path);
@@ -217,7 +267,7 @@ mod tests {
     use super::*;
 
     fn parse(text: &str) -> Result<Config, toml::de::Error> {
-        toml::from_str(text)
+        Config::parse(text)
     }
 
     #[test]
@@ -236,6 +286,30 @@ mod tests {
         assert!(parse(&typo).is_err());
         let remote = DEFAULT_CONFIG_TOML.replace(r#"backend = "local""#, r#"backend = "s3""#);
         assert!(parse(&remote).is_err());
+    }
+
+    /// Defaults fill gaps but never hide a mistake: every error points at its
+    /// line in the file and shows it.
+    #[test]
+    fn mistakes_are_reported_at_their_line() {
+        for (text, line, shown) in [
+            (
+                "[session]\nidle_timeout_sec = 60\n",
+                "line 2",
+                "unknown field `idle_timeout_sec`",
+            ),
+            (
+                "[session]\nidle_timeout_secs = \"1h\"\n",
+                "line 2",
+                "idle_timeout_secs = \"1h\"",
+            ),
+            ("[sesion]\n", "line 1", "unknown field `sesion`"),
+            ("session = 5\n", "line 1", "expected struct Session"),
+            ("[server]\nbind_addr = \n", "line 2", "bind_addr = "),
+        ] {
+            let error = parse(text).err().unwrap().to_string();
+            assert!(error.contains(line) && error.contains(shown), "{error}");
+        }
     }
 
     #[test]
@@ -294,6 +368,49 @@ mod tests {
         assert!(error.contains("albums.toml"), "{error}");
         assert!(started.elapsed() < Duration::from_millis(500));
         assert_eq!(fs::read_to_string(&path).unwrap(), "[server\n");
+    }
+
+    /// A config written by an older version lacks the settings added since;
+    /// they take their defaults, and the file is left as it is.
+    #[test]
+    fn settings_missing_from_an_older_config_take_their_defaults() {
+        let defaults = parse(DEFAULT_CONFIG_TOML).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("albums.toml");
+        let (before_session, _) = DEFAULT_CONFIG_TOML.split_once("[session]").unwrap();
+        let older = before_session
+            .lines()
+            .filter(|line| !line.starts_with("settle_secs"))
+            .map(|line| match line.starts_with("rescan_secs") {
+                true => "rescan_secs = 61",
+                false => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(older.contains("rescan_secs = 61"));
+        assert_ne!(defaults.storage.rescan_interval, Duration::from_secs(61));
+        fs::write(&path, &older).unwrap();
+
+        let config = Config::load_or_create(&path).unwrap();
+        assert_eq!(config.storage.rescan_interval, Duration::from_secs(61));
+        assert_eq!(config.storage.settle_time, defaults.storage.settle_time);
+        assert_eq!(config.session.idle_timeout, defaults.session.idle_timeout);
+        assert_eq!(config.session.max_lifetime, defaults.session.max_lifetime);
+        assert_eq!(fs::read_to_string(&path).unwrap(), older);
+    }
+
+    /// Thumbnails go beside the config, as the link key does, and children
+    /// are never run unconfined unless the owner asks; a config from before
+    /// thumbnails gets both.
+    #[test]
+    fn thumbnails_are_kept_beside_the_config_and_confined() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("albums.toml");
+        let (before, _) = DEFAULT_CONFIG_TOML.split_once("[thumbnails]").unwrap();
+        fs::write(&path, before).unwrap();
+        let config = Config::load_or_create(&path).unwrap();
+        assert_eq!(config.thumbnails.dir, dir.path().join("thumbnails"));
+        assert!(!config.thumbnails.allow_unconfined);
     }
 
     #[cfg(unix)]

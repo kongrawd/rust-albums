@@ -2,7 +2,7 @@
 //! headers on every response.
 
 use crate::auth::{self, Verdict};
-use crate::{AppState, access_log, html, routes, session};
+use crate::{AppState, access_log, html, library, routes, session};
 use axum::{
     Extension, Form, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
@@ -12,10 +12,12 @@ use axum::{
     routing::{get, post},
 };
 use maud::Markup;
+use mime_guess::Mime;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tower::ServiceExt;
+use tower_http::compression::{CompressionLayer, CompressionLevel};
 use tower_http::{services::ServeFile, set_header::SetResponseHeaderLayer};
 
 /// Pages run no scripts and load nothing but images and videos from this
@@ -62,6 +64,10 @@ const CROSS_ORIGIN_RESOURCE_POLICY: HeaderName =
 ///   path gets a plain 404 instead of a sign-in redirect.
 /// - The cross-site check wraps the page and original headers, so its 403 carries
 ///   only the headers every response gets (nosniff, CORP and HSTS).
+/// - Only pages are gzipped, at the fastest level: a large album page shrinks
+///   about sevenfold for a few milliseconds. Originals are compressed already,
+///   and gzipping a video would break the ranges it is played from. No secret
+///   is ever in a page body, which is what a compression attack (BREACH) needs.
 pub fn router(state: AppState) -> Router {
     let sign_in_required = middleware::from_fn_with_state(state.clone(), auth::require_sign_in);
 
@@ -76,10 +82,14 @@ pub fn router(state: AppState) -> Router {
     let pages = sign_in_pages
         .merge(album_pages)
         .layer(set_header(header::CONTENT_SECURITY_POLICY, PAGE_CSP))
-        .layer(set_header(header::CACHE_CONTROL, NO_STORE));
+        .layer(set_header(header::CACHE_CONTROL, NO_STORE))
+        .layer(CompressionLayer::new().quality(CompressionLevel::Fastest));
 
-    let originals = Router::new()
-        .route(routes::ORIGINAL, get(serve_original))
+    let originals = Router::new().route(routes::ORIGINAL, get(serve_original));
+    // Thumbnails are small originals: the same sign-in and headers.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let originals = originals.route(routes::THUMBNAIL, get(serve_thumbnail));
+    let originals = originals
         .route_layer(sign_in_required)
         .layer(set_header(header::CONTENT_SECURITY_POLICY, ORIGINAL_CSP))
         .layer(set_header(header::CACHE_CONTROL, ORIGINAL_CACHE));
@@ -238,12 +248,17 @@ async fn serve_original(
         .library
         .item_path(&item_id)
         .ok_or(StatusCode::NOT_FOUND)?;
+    let content_type = library::content_type(&item_path).ok_or(StatusCode::NOT_FOUND)?;
+    let content_type: Mime = content_type.parse().expect("a valid media type");
     let open = async {
         let file = state.library.item_file(&item_path).await;
         let file = file.ok_or(StatusCode::NOT_FOUND)?;
-        // ServeFile handles Content-Type, Range (video seeking) and conditional
-        // requests. No sendfile: rustls encrypts in user space, so zero-copy can't apply.
-        let Ok(response) = ServeFile::new(file).oneshot(request).await;
+        // ServeFile handles Range (video seeking) and conditional requests; the
+        // Content-Type is the item's own. No sendfile: rustls encrypts in user
+        // space, so zero-copy can't apply.
+        let Ok(response) = ServeFile::new_with_mime(file, &content_type)
+            .oneshot(request)
+            .await;
         Ok(response)
     };
     // A hung mount must not hang the request too: finding the file, opening it
@@ -251,6 +266,42 @@ async fn serve_original(
     tokio::time::timeout(ORIGINAL_OPEN_TIMEOUT, open)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+}
+
+/// An item's thumbnail: made the first time it is asked for and kept, then
+/// served as a file, conditional requests and all. Items with none answer 404,
+/// and their tiles keep their plain square.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn serve_thumbnail(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    request: Request,
+) -> Result<impl IntoResponse, StatusCode> {
+    use crate::thumbnail::{self, child::Original};
+    let thumbnails = state.thumbnails.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let item_path = state
+        .library
+        .item_path(&item_id)
+        .filter(|path| thumbnail::has_thumbnail(path))
+        .ok_or(StatusCode::NOT_FOUND)?;
+    // As for an original, a hung mount must not hang the request: finding
+    // the file and opening it share one time limit.
+    let open = async {
+        let file = state.library.item_file(&item_path).await?;
+        let open = tokio::task::spawn_blocking(move || Original::open(&file));
+        open.await.ok()?.ok()
+    };
+    let original = tokio::time::timeout(ORIGINAL_OPEN_TIMEOUT, open)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let made = thumbnails
+        .thumbnail(&item_id, original)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let jpeg = mime_guess::mime::IMAGE_JPEG;
+    let Ok(response) = ServeFile::new_with_mime(made, &jpeg).oneshot(request).await;
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -265,6 +316,8 @@ mod tests {
 
     /// Size of the test video, `b.mp4`, in bytes.
     const VIDEO_LEN: usize = 64;
+    /// The test videos' contents.
+    const VIDEO: [u8; VIDEO_LEN] = [0; VIDEO_LEN];
     const OLD_BROWSER: &str = "Mozilla/5.0 (Macintosh) AppleWebKit/605 Safari/605";
     const ALICE: [u8; 4] = [192, 168, 1, 10];
     const MALLORY: [u8; 4] = [10, 0, 0, 66];
@@ -277,6 +330,8 @@ mod tests {
         /// The pages showing the photo and the video.
         photo_page: String,
         video_page: String,
+        /// Link ids of the library, for items a test adds.
+        ids: LinkIds,
     }
 
     /// A router over a temporary library with one album, `Trip`, holding the
@@ -289,33 +344,79 @@ mod tests {
 
     /// [`app`], with its access log kept in memory.
     async fn app_with_log() -> (tempfile::TempDir, Router, Links, access_log::Lines) {
+        app_with_files(&[]).await
+    }
+
+    /// [`app_with_log`], with more items (`VIDEO_LEN` zero bytes each) at
+    /// these item paths, in any album; their folders are created.
+    async fn app_with_files(
+        items: &[&str],
+    ) -> (tempfile::TempDir, Router, Links, access_log::Lines) {
+        let files: Vec<(&str, &[u8])> = [("Trip/a.svg", b"<svg/>".as_slice())]
+            .into_iter()
+            .chain(
+                std::iter::once(&"Trip/b.mp4")
+                    .chain(items)
+                    .map(|item| (*item, &VIDEO[..])),
+            )
+            .collect();
+        let (dir, router, ids, log) = app_over("{album_name}/{file_name}", &files).await;
+        let (photo_id, video_id) = (ids.item("Trip/a.svg"), ids.item("Trip/b.mp4"));
+        let links = Links {
+            album: routes::album_url(&ids.album("Trip")).to_string(),
+            photo: routes::original_url(&photo_id).to_string(),
+            video: routes::original_url(&video_id).to_string(),
+            photo_page: routes::item_page_url(&photo_id).to_string(),
+            video_page: routes::item_page_url(&video_id).to_string(),
+            ids,
+        };
+        (dir, router, links, log)
+    }
+
+    /// A router over a temporary library of `files` (item path and contents)
+    /// laid out by `pattern`; their folders are created. Also returns the
+    /// library's link ids and its access log, kept in memory.
+    async fn app_over(
+        pattern: &str,
+        files: &[(&str, &[u8])],
+    ) -> (tempfile::TempDir, Router, LinkIds, access_log::Lines) {
+        app_over_with(pattern, files, true).await
+    }
+
+    /// [`app_over`], with or without thumbnails (as where none can be made).
+    async fn app_over_with(
+        pattern: &str,
+        files: &[(&str, &[u8])],
+        thumbnails: bool,
+    ) -> (tempfile::TempDir, Router, LinkIds, access_log::Lines) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("storage");
-        std::fs::create_dir_all(root.join("Trip")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join(".albums-root"), "").unwrap();
-        std::fs::write(root.join("Trip/a.svg"), "<svg/>").unwrap();
-        std::fs::write(root.join("Trip/b.mp4"), [0u8; VIDEO_LEN]).unwrap();
+        for (path, contents) in files {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, contents).unwrap();
+        }
         let link_ids = LinkIds::load_or_create(&dir.path().join("link.key")).unwrap();
-        let (photo_id, video_id) = (link_ids.item("Trip/a.svg"), link_ids.item("Trip/b.mp4"));
-        let links = Links {
-            album: routes::album_url(&link_ids.album("Trip")),
-            photo: routes::original_url(&photo_id),
-            video: routes::original_url(&video_id),
-            photo_page: routes::item_page_url(&photo_id),
-            video_page: routes::item_page_url(&video_id),
-        };
         let storage = config::Storage {
             backend: config::StorageBackend::Local,
             root: root.clone(),
-            pattern: "{album_name}/{file_name}".into(),
+            pattern: pattern.into(),
             marker: ".albums-root".into(),
             rescan_interval: Duration::from_secs(30),
             settle_time: Duration::ZERO,
             ignore: Vec::new(),
             link_key: dir.path().join("link.key"),
         };
-        let library = Library::open(&storage, link_ids).await.unwrap();
+        let library = Library::open(&storage, link_ids.clone()).await.unwrap();
         let log = Arc::new(Mutex::new(Vec::new()));
+        // Made by a child that writes back the video: tests choose it.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let thumbnails = thumbnails.then(|| {
+            let child = crate::thumbnail::testing::fake("echo");
+            crate::thumbnail::testing::service(child, Duration::from_secs(5), "test", dir.path()).0
+        });
         let router = router(Arc::new(App {
             library,
             credentials: Credentials::new("alice", "pw").unwrap(),
@@ -325,8 +426,10 @@ mod tests {
             })),
             hsts_max_age: Duration::from_secs(60),
             access_log: access_log::AccessLog::Memory(log.clone()),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            thumbnails,
         }));
-        (dir, router, links, log)
+        (dir, router, link_ids, log)
     }
 
     async fn send(app: &Router, request: Builder) -> Response {
@@ -579,18 +682,95 @@ mod tests {
         }
     }
 
+    /// A photo tile shows its original, loaded lazily; a video tile shows its
+    /// thumbnail, lazily too, under a play glyph, but no `<video>`, so the
+    /// video isn't fetched until it is opened.
     #[tokio::test]
     async fn album_pages_fetch_media_only_when_needed() {
         let (_root, app, links) = app().await;
+        let video_id = links.ids.item("Trip/b.mp4");
         let cookie = session_cookie(&app).await;
         let html = body_text(send(&app, open(&links.album, Some(&cookie))).await).await;
-        assert!(html.contains(&format!(r#"loading="lazy" src="{}""#, links.photo)));
-        // Browsers can't lazy-load `<video>`, so video tiles have none.
-        assert!(!html.contains("<video"), "{html}");
-        assert!(
-            html.contains("b.mp4"),
-            "the file name is shown, not only a tooltip"
+        let photo = format!(
+            r#"<a class="tile" href="{}" title="a.svg"><img loading="lazy" src="{}" alt=""><span class="caption">a.svg</span></a>"#,
+            links.photo_page, links.photo
         );
+        let video = format!(
+            r#"<a class="tile" href="{}" title="b.mp4"><img loading="lazy" src="{}" alt=""><span class="play" aria-hidden="true">▶{}</span><span class="caption">b.mp4</span></a>"#,
+            links.video_page,
+            routes::thumbnail_url(&video_id),
+            '\u{FE0E}'
+        );
+        assert!(html.contains(&photo), "{html}");
+        assert!(html.contains(&video), "{html}");
+        assert!(!html.contains("<video"), "{html}");
+    }
+
+    /// A tile's tooltip is the file name and the item's metadata, which its
+    /// page shows as chips; names are escaped wherever they appear.
+    #[tokio::test]
+    async fn tiles_and_item_pages_show_item_metadata() {
+        let photo = r#"Lake/001_a&b "x" <y>.jpg"#;
+        let files = [(photo, &b"x"[..]), ("Lake/002_clip.mp4", &VIDEO[..])];
+        let (_dir, app, ids, _log) = app_over("{album_name}/{seq}_{file_name}", &files).await;
+        let cookie = session_cookie(&app).await;
+        let (photo_id, video_id) = (ids.item(photo), ids.item("Lake/002_clip.mp4"));
+        let album = routes::album_url(&ids.album("Lake")).to_string();
+        let html = body_text(send(&app, open(&album, Some(&cookie))).await).await;
+        let name = "001_a&amp;b &quot;x&quot; &lt;y&gt;.jpg";
+        let tiles = [
+            format!(
+                r#"<a class="tile" href="{}" title="{name} · seq: 001"><img loading="lazy" src="{}" alt=""><span class="caption">{name}</span></a>"#,
+                routes::item_page_url(&photo_id),
+                routes::original_url(&photo_id)
+            ),
+            format!(
+                r#"<a class="tile" href="{}" title="002_clip.mp4 · seq: 002"><img loading="lazy" src="{}" alt=""><span class="play" aria-hidden="true">▶{}</span><span class="caption">002_clip.mp4</span></a>"#,
+                routes::item_page_url(&video_id),
+                routes::thumbnail_url(&video_id),
+                '\u{FE0E}'
+            ),
+        ];
+        for tile in tiles {
+            assert!(html.contains(&tile), "{tile}\n{html}");
+        }
+
+        let page = routes::item_page_url(&photo_id).to_string();
+        let html = body_text(send(&app, open(&page, Some(&cookie))).await).await;
+        for shown in [
+            format!(r#"<p class="name">{name}</p>"#),
+            r#"<div class="chips"><span class="chip">seq: 001</span></div>"#.to_string(),
+        ] {
+            assert!(html.contains(&shown), "{shown}\n{html}");
+        }
+    }
+
+    /// An album's cover is the picture of its first item that has one, loaded
+    /// lazily: a photo's original or a video's thumbnail. A WebM video has no
+    /// thumbnail, so it is passed over; an album of those gets an empty cover.
+    #[tokio::test]
+    async fn album_covers_show_the_first_picture() {
+        let files = ["Clips/c.mp4", "Mix/0.webm", "Mix/1.svg", "Web/w.webm"];
+        let (_dir, app, links, _log) = app_with_files(&files).await;
+        let cookie = session_cookie(&app).await;
+        let html = body_text(send(&app, open(routes::HOME, Some(&cookie))).await).await;
+        let cover = |album: &str, src: Option<String>| {
+            let img = src.map_or(String::new(), |src| {
+                format!(r#"<img loading="lazy" src="{src}" alt="">"#)
+            });
+            let href = routes::album_url(&links.ids.album(album)).to_string();
+            format!(r#"<a class="album" href="{href}"><div class="cover">{img}</div>"#)
+        };
+        let original = |item| Some(routes::original_url(&links.ids.item(item)).to_string());
+        let thumbnail = |item| Some(routes::thumbnail_url(&links.ids.item(item)).to_string());
+        for expected in [
+            cover("Trip", original("Trip/a.svg")),
+            cover("Clips", thumbnail("Clips/c.mp4")),
+            cover("Mix", original("Mix/1.svg")),
+            cover("Web", None),
+        ] {
+            assert!(html.contains(&expected), "{expected}\n{html}");
+        }
     }
 
     /// What `ORIGINAL_CSP` allows and forbids (its doc says why), and that every
@@ -645,7 +825,7 @@ mod tests {
             ),
             (
                 "unknown",
-                open(&routes::original_url("unknown"), Some(&cookie)),
+                open(&routes::original_url("unknown").to_string(), Some(&cookie)),
                 StatusCode::NOT_FOUND,
             ),
             (
@@ -664,6 +844,126 @@ mod tests {
             assert_eq!(response.status(), status, "{case}");
             let csp = header_of(&response, header::CONTENT_SECURITY_POLICY);
             assert_eq!(csp, ORIGINAL_CSP, "{case}");
+        }
+    }
+
+    /// Originals are served with a type every browser plays: QuickTime and M4V
+    /// files are MP4 inside, and Chromium refuses to play `video/quicktime`.
+    #[tokio::test]
+    async fn originals_are_served_with_a_type_browsers_play() {
+        let (_dir, app, links, _log) = app_with_files(&["Trip/c.MOV", "Trip/d.m4v"]).await;
+        let cookie = session_cookie(&app).await;
+        let original = |path: &str| routes::original_url(&links.ids.item(path)).to_string();
+        for (url, content_type) in [
+            (links.photo.clone(), "image/svg+xml"),
+            (links.video.clone(), "video/mp4"),
+            (original("Trip/c.MOV"), "video/mp4"),
+            (original("Trip/d.m4v"), "video/mp4"),
+        ] {
+            let response = send(&app, open(&url, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::OK, "{url}");
+            assert_eq!(
+                header_of(&response, header::CONTENT_TYPE),
+                content_type,
+                "{url}"
+            );
+        }
+    }
+
+    /// A video's thumbnail is a JPEG for signed-in users, made the first time
+    /// and kept: asked again unchanged, it costs a 304. A photo, a WebM video
+    /// or a video with no thumbnail answers 404, so its tile keeps its plain
+    /// square and play glyph.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn video_tiles_load_their_thumbnails() {
+        let files = [
+            ("Trip/a.svg", &b"<svg/>"[..]),
+            ("Trip/b.mp4", crate::thumbnail::testing::JPEG),
+            ("Trip/c.mp4", &VIDEO[..]),
+            // Has a JPEG in it too: only the kind of file keeps it from one.
+            ("Trip/d.webm", crate::thumbnail::testing::JPEG),
+        ];
+        let (_dir, app, ids, _log) = app_over("{album_name}/{file_name}", &files).await;
+        let thumbnail = |path: &str| routes::thumbnail_url(&ids.item(path)).to_string();
+
+        let response = send(&app, open(&thumbnail("Trip/b.mp4"), None)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let cookie = session_cookie(&app).await;
+        let response = send(&app, open(&thumbnail("Trip/b.mp4"), Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header_of(&response, header::CONTENT_TYPE), "image/jpeg");
+        let modified = header_of(&response, header::LAST_MODIFIED).to_string();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], crate::thumbnail::testing::JPEG);
+        let again = open(&thumbnail("Trip/b.mp4"), Some(&cookie))
+            .header(header::IF_MODIFIED_SINCE, modified);
+        assert_eq!(send(&app, again).await.status(), StatusCode::NOT_MODIFIED);
+
+        for none in ["Trip/a.svg", "Trip/c.mp4", "Trip/d.webm"] {
+            let response = send(&app, open(&thumbnail(none), Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{none}");
+        }
+
+        // Where none can be made, a video's tile keeps its plain square too.
+        let (_dir, off, ids, _log) = app_over_with("{album_name}/{file_name}", &files, false).await;
+        let cookie = session_cookie(&off).await;
+        let url = routes::thumbnail_url(&ids.item("Trip/b.mp4")).to_string();
+        let response = send(&off, open(&url, Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Pages are gzipped for browsers that accept it (a large album page
+    /// shrinks about sevenfold). Originals never are: they are compressed
+    /// already, and videos are fetched in ranges. A gzipped page's size isn't
+    /// known up front, so its log line shows `-`.
+    #[tokio::test]
+    async fn pages_are_gzipped_but_originals_never() {
+        use std::io::Read;
+        let (_root, app, links, log) = app_with_log().await;
+        let cookie = session_cookie(&app).await;
+        let gzip = |request: Builder| request.header(header::ACCEPT_ENCODING, "gzip");
+        for (page, cookie) in [
+            (links.album.as_str(), Some(cookie.as_str())),
+            (routes::SIGN_IN, None),
+        ] {
+            let plain = body_text(send(&app, open(page, cookie)).await).await;
+            let response = send(&app, gzip(open(page, cookie))).await;
+            assert_eq!(response.status(), StatusCode::OK, "{page}");
+            assert_eq!(
+                header_of(&response, header::CONTENT_ENCODING),
+                "gzip",
+                "{page}"
+            );
+            assert_eq!(
+                header_of(&response, header::VARY),
+                "accept-encoding",
+                "{page}"
+            );
+            let line = log.lock().unwrap().last().cloned().unwrap();
+            assert!(line.contains(" 200 - "), "{line}");
+            let gzipped = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let mut html = String::new();
+            flate2::read::GzDecoder::new(&gzipped[..])
+                .read_to_string(&mut html)
+                .unwrap();
+            assert_eq!(html, plain, "{page}");
+        }
+
+        let range = play(&links.video, Some(&cookie)).header(header::RANGE, "bytes=0-1");
+        for (request, status) in [
+            (open(&links.photo, Some(&cookie)), StatusCode::OK),
+            (open(&links.video, Some(&cookie)), StatusCode::OK),
+            (range, StatusCode::PARTIAL_CONTENT),
+        ] {
+            let response = send(&app, gzip(request)).await;
+            assert_eq!(response.status(), status);
+            assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
         }
     }
 
@@ -988,6 +1288,30 @@ mod tests {
         }
     }
 
+    /// Album pages take album link ids, and nothing else: among several
+    /// albums, each opens by its own id.
+    #[tokio::test]
+    async fn album_pages_take_only_album_link_ids() {
+        let (_dir, app, links, _log) =
+            app_with_files(&["Clips/c.mp4", "Lake/d.mp4", "Zoo/e.mp4"]).await;
+        let cookie = session_cookie(&app).await;
+        for name in ["Clips", "Lake", "Trip", "Zoo"] {
+            let page = routes::album_url(&links.ids.album(name)).to_string();
+            let response = send(&app, open(&page, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::OK, "{page}");
+            let html = body_text(response).await;
+            let shown = format!(r#"<p class="name">{name}</p>"#);
+            assert!(html.contains(&shown), "{html}");
+        }
+        let photo_id = links.photo.trim_start_matches("/media/");
+        for page in
+            [routes::album_url("unknown"), routes::album_url(photo_id)].map(|page| page.to_string())
+        {
+            let response = send(&app, open(&page, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{page}");
+        }
+    }
+
     /// Item pages take the same link ids as items, and nothing else.
     #[tokio::test]
     async fn item_pages_take_only_item_link_ids() {
@@ -997,7 +1321,9 @@ mod tests {
         for page in [
             routes::item_page_url("unknown"),
             routes::item_page_url(album_id),
-        ] {
+        ]
+        .map(|page| page.to_string())
+        {
             let response = send(&app, open(&page, Some(&cookie))).await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{page}");
         }

@@ -47,8 +47,9 @@ RUN --mount=type=cache,target=/src/target,id=rust-albums-target-${TARGETPLATFORM
 
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
 COPY --from=build /rust-albums /usr/local/bin/rust-albums
-# Writable state (config, certificates, link key) lives in /state; mount a volume
-# there. Owned by the image's non-root user so a new named volume inherits it.
+# Writable state (config, certificates, link key, thumbnails) lives in /state;
+# mount a volume there. Owned by the image's non-root user so a new named
+# volume inherits it.
 COPY --from=build --chown=65532:65532 /state /state
 ENV ALBUMS_CONFIG=/state/albums.toml \
     ALBUMS_BIND_ADDR=0.0.0.0:8443 \
@@ -57,5 +58,6 @@ USER 65532:65532
 EXPOSE 8443
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD ["/usr/local/bin/rust-albums", "--healthcheck"]
-# No init process (tini): the binary handles SIGTERM itself and starts no children.
+# No init process (tini): the binary handles SIGTERM itself and waits for every
+# thumbnail child it starts, so none is left behind.
 ENTRYPOINT ["/usr/local/bin/rust-albums"]

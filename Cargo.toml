@@ -10,9 +10,12 @@ axum = { version = "0.8", default-features = false, features = ["http1", "http2"
 axum-server = { version = "0.9", features = ["tls-rustls-no-provider"] }
 # Cookie and Basic-auth header parsing.
 axum-extra = { version = "0.12", default-features = false, features = ["cookie", "typed-header"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "time", "io-util"] }
+# "process" and "sync": thumbnails are decoded in child processes, a few at a
+# time; they add no crates.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "time", "io-util", "process", "sync"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
-tower-http = { version = "0.7", default-features = false, features = ["fs", "set-header"] }
+# Gzip only: brotli would add about 1 MB to the binary for a few percent smaller pages.
+tower-http = { version = "0.7", default-features = false, features = ["fs", "set-header", "compression-gzip"] }
 maud = { version = "0.27", features = ["axum"] }
 # The plain-HTTP answer on the HTTPS port (already in the tree via axum-server).
 hyper = { version = "1", default-features = false, features = ["http1", "server"] }
@@ -30,11 +33,25 @@ subtle = "2"
 walkdir = "2"
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
 percent-encoding = "2"
+# File name -> media type (already in the tree via tower-http).
+mime_guess = { version = "2", default-features = false }
 unicode-normalization = "0.1"
 serde = { version = "1", features = ["derive"] }
 toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
 # Access-log timestamps (already in the tree via cookie and rcgen).
 time = { version = "0.3", default-features = false, features = ["std"] }
+# Video thumbnails: pure-Rust H.264 and HEVC decoders with no dependencies of
+# their own, pinned exactly as they are young; one keyframe per video is decoded.
+# rust_h264's dev-internals only makes some of its modules public (sps, pps,
+# slice, sha256); its SPS parser is used to check picture sizes, as it has no
+# size limit of its own.
+rust_h264 = { version = "=0.6.1", default-features = false, features = ["std", "dev-internals"] }
+rust_h265 = "=0.4.1"
+
+# Linux: the thumbnail child confines itself with Landlock. From the Landlock
+# project, pinned as the decoders are.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "=0.4.7"
 
 [profile.release]
 lto = true
@@ -42,10 +59,22 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# The video decoders are far too slow unoptimised, so tests optimise them.
+[profile.dev.package.rust_h264]
+opt-level = 3
+
+[profile.dev.package.rust_h265]
+opt-level = 3
+
 [dev-dependencies]
 tempfile = "3"
+# Reads gzipped pages back (already in the tree via tower-http's compression).
+flate2 = "1"
+# Reads thumbnails back (image-rs's JPEG decoder); tests only, never in the binary.
+jpeg-decoder = { version = "0.3", default-features = false }
 tokio = { version = "1", features = ["test-util"] }
 
 [lints.clippy]
-# stdout carries only the access log; other messages go to stderr.
+# stdout carries only the access log (or, from a child, its thumbnail); other
+# messages go to stderr.
 print_stdout = "deny"

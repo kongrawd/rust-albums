@@ -1,0 +1,8 @@
+; The thumbnail child's Seatbelt profile (macOS): everything is denied but
+; what a process needs to start (Apple's bsd.sb) and running the program
+; itself, PROGRAM. The child keeps what it was handed: stdin (the original),
+; stdout and stderr. Used by thumbnail::sandbox::seatbelt.
+(version 1)
+(deny default)
+(import "bsd.sb")
+(allow process-exec (literal (param "PROGRAM")))
