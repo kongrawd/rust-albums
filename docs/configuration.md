@@ -4,6 +4,7 @@
 
 Settings live in `./albums.toml`, or the path in `$ALBUMS_CONFIG`. The first run creates it from [`albums.default.toml`](../albums.default.toml), which explains every setting and its default; an existing file is never rewritten. Restart after editing.
 
+- Settings left out of the file use their defaults.
 - Unknown keys are rejected, so typos don't go unnoticed.
 - Relative paths are resolved against the config file's folder, not the working directory.
 - Secrets never go in the file. Credentials come from the environment only: `AUTH_USER` (must not contain `:`) and `AUTH_PASS`.
