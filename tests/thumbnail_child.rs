@@ -1,7 +1,7 @@
 //! `rust-albums --thumbnail`: the child process the server decodes videos in.
 //! It reads the video from stdin, which must be a regular file, and writes
 //! the thumbnail to stdout.
-#![cfg(unix)]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::fs::File;
 use std::io::Write;
@@ -41,6 +41,31 @@ fn writes_the_thumbnail_of_the_video_on_stdin() {
     decoder.decode().unwrap();
     let info = decoder.info().unwrap();
     assert_eq!((info.width, info.height), (64, 96), "upright");
+}
+
+/// On macOS the server starts the child under its Seatbelt profile (on
+/// Linux the child confines itself, in every test here): under it, the child
+/// still makes the thumbnail. The command is built as `sandbox::seatbelt`
+/// builds it, which tests can't reach from here.
+#[cfg(target_os = "macos")]
+#[test]
+fn writes_the_thumbnail_under_the_sandbox_profile() {
+    let profile = std::fs::read_to_string(Path::new(ROOT).join("src/thumbnail/child.sb")).unwrap();
+    let program = env!("CARGO_BIN_EXE_rust-albums");
+    #[expect(clippy::disallowed_methods, reason = "runs the binary under test")]
+    let mut command = Command::new("/usr/bin/sandbox-exec");
+    let output = command
+        .args(["-p", &profile, "-D", &format!("PROGRAM={program}"), program])
+        .arg("--thumbnail")
+        .env_clear()
+        .stdin(testdata(PORTRAIT))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let mut decoder = jpeg_decoder::Decoder::new(&output.stdout[..]);
+    decoder.decode().unwrap();
+    let info = decoder.info().unwrap();
+    assert_eq!((info.width, info.height), (64, 96));
 }
 
 /// A file with nothing to make a thumbnail of exits with sysexits'

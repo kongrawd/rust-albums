@@ -47,6 +47,11 @@ time = { version = "0.3", default-features = false, features = ["std"] }
 rust_h264 = { version = "=0.6.1", default-features = false, features = ["std", "dev-internals"] }
 rust_h265 = "=0.4.1"
 
+# Linux: the thumbnail child confines itself with Landlock. From the Landlock
+# project, pinned as the decoders are.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "=0.4.7"
+
 [profile.release]
 lto = true
 codegen-units = 1

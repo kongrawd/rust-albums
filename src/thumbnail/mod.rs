@@ -5,11 +5,13 @@
 // Wired into the server by the thumbnail route; until then only tests use it.
 #![allow(dead_code)]
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod child;
 mod jpeg;
 pub mod mp4;
 pub mod picture;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod sandbox;
 pub mod video;
 
 use std::{fmt, io};

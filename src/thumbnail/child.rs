@@ -4,9 +4,11 @@
 //! [`Thumbnailer`] starts these children: a thumbnailer, as GNOME calls a
 //! program that makes one thumbnail.
 //!
-//! Unix only: tested on Linux (CI) and macOS (by hand), built nowhere else.
+//! Linux and macOS only: tested on Linux (CI) and macOS (by hand), each
+//! confined its own way (see `sandbox`); built nowhere else.
 
 use super::Error;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{File, Metadata};
 use std::io::{self, Write};
@@ -18,6 +20,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// The file holds nothing a thumbnail can be made of (`EX_DATAERR`).
 const UNSUPPORTED: i32 = 65;
+/// The child couldn't confine itself, so it decoded nothing (`EX_OSERR`).
+const UNCONFINED: i32 = 71;
 /// An input/output error (`EX_IOERR`): reading the video failed (or stdin
 /// isn't a regular file), or writing the thumbnail did.
 const IO_ERROR: i32 = 74;
@@ -43,7 +47,16 @@ pub fn run() -> i32 {
     // the server. Any process may raise its own score. Checked by hand
     // (strace in Docker); no test can see it.
     #[cfg(target_os = "linux")]
-    let _ = std::fs::write("/proc/self/oom_score_adj", "1000");
+    {
+        let _ = std::fs::write("/proc/self/oom_score_adj", "1000");
+        // From here on it reaches only its stdin, stdout and stderr; on
+        // macOS the server started it confined. That it confines itself is
+        // checked by hand (strace in Docker); tests check what it denies.
+        if let Err(err) = super::sandbox::confine() {
+            eprintln!("sandbox: {err}");
+            return UNCONFINED;
+        }
+    }
     match thumbnail() {
         Ok(jpeg) => {
             let mut stdout = io::stdout().lock();
@@ -93,6 +106,8 @@ impl Original {
 /// Makes thumbnails in child processes running `program --thumbnail`.
 pub struct Thumbnailer {
     program: PathBuf,
+    /// What comes before `--thumbnail` (the sandbox's, on macOS).
+    args: Vec<OsString>,
     timeout: Duration,
 }
 
@@ -101,6 +116,9 @@ pub struct Thumbnailer {
 pub enum Failure {
     /// No child could be started: the platform's fault, not the file's.
     NotStarted(io::Error),
+    /// The child couldn't confine itself, so it decoded nothing: the
+    /// platform's fault too. Why, as the child says.
+    Unconfined(String),
     /// The file holds nothing a thumbnail can be made of: why, as the child
     /// says.
     Unsupported(String),
@@ -120,6 +138,7 @@ impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotStarted(err) => write!(f, "no child started: {err}"),
+            Self::Unconfined(why) => write!(f, "unconfined: {why}"),
             Self::Unsupported(why) => write!(f, "unsupported: {why}"),
             Self::Io(why) => write!(f, "i/o error: {why}"),
             Self::Crashed(why) => write!(f, "crashed: {why}"),
@@ -130,23 +149,32 @@ impl fmt::Display for Failure {
 }
 
 impl Thumbnailer {
-    /// Children running this very program, each given [`TIME_LIMIT`]. On
-    /// Linux through `/proc/self/exe`, which still finds it after an upgrade
-    /// replaced the file on disk (checked by hand in Docker).
+    /// Children running this very program, confined, each given
+    /// [`TIME_LIMIT`]. On Linux through `/proc/self/exe`, which still finds
+    /// it after an upgrade replaced the file on disk (checked by hand in
+    /// Docker), and the child confines itself; on macOS under Seatbelt, as a
+    /// child can't confine itself there.
     pub fn own_binary() -> io::Result<Self> {
-        let program = if cfg!(target_os = "linux") {
-            PathBuf::from("/proc/self/exe")
-        } else {
+        #[cfg(target_os = "linux")]
+        let (program, args) = (PathBuf::from("/proc/self/exe"), Vec::new());
+        #[cfg(target_os = "macos")]
+        let (program, args) = {
             #[expect(clippy::disallowed_methods, reason = "where /proc/self/exe isn't")]
-            std::env::current_exe()?
+            let this_program = std::env::current_exe()?;
+            super::sandbox::seatbelt(&this_program)
         };
-        Ok(Self::new(program, TIME_LIMIT))
+        Ok(Self {
+            program,
+            args,
+            timeout: TIME_LIMIT,
+        })
     }
 
-    /// Children running `program`, each given `timeout`.
+    /// Children running `program` as it is, each given `timeout`.
     pub fn new(program: impl Into<PathBuf>, timeout: Duration) -> Self {
         Self {
             program: program.into(),
+            args: Vec::new(),
             timeout,
         }
     }
@@ -157,6 +185,7 @@ impl Thumbnailer {
         #[expect(clippy::disallowed_methods, reason = "the one place children start")]
         let mut command = tokio::process::Command::new(&self.program);
         let mut child = command
+            .args(&self.args)
             .arg("--thumbnail")
             .env_clear()
             .stdin(original.0)
@@ -212,6 +241,7 @@ impl Thumbnailer {
                 stdout.len()
             ))),
             Some(UNSUPPORTED) => Err(Failure::Unsupported(why())),
+            Some(UNCONFINED) => Err(Failure::Unconfined(why())),
             Some(IO_ERROR) => Err(Failure::Io(why())),
             _ => Err(Failure::Crashed(match why() {
                 why if why.is_empty() => status.to_string(),
@@ -295,6 +325,10 @@ mod tests {
                     "printf 'damaged\\nthumbnail abc: made\\n' >&2; exit 65",
                 ),
                 ("unreadable", "echo 'Input/output error' >&2; exit 74"),
+                (
+                    "unconfined",
+                    "echo 'sandbox: Landlock is not supported' >&2; exit 71",
+                ),
                 // A decoder bug under `panic = "abort"`.
                 ("aborts", "echo 'decoder bug' >&2; kill -ABRT $$"),
                 // As the out-of-memory killer does.
@@ -397,7 +431,20 @@ mod tests {
         assert_eq!(failure.to_string(), "i/o error: Input/output error");
     }
 
-    /// Any end but the three the child's exit codes say is a crash, whether
+    /// A child that couldn't confine itself decoded nothing: the platform's
+    /// fault, as a child that couldn't start, never the file's.
+    #[tokio::test]
+    async fn tells_when_the_child_could_not_be_confined() {
+        let thumbnailer = Thumbnailer::new(fake("unconfined"), Duration::from_secs(5));
+        let failure = thumbnailer.thumbnail(original(b"")).await.unwrap_err();
+        assert!(matches!(failure, Failure::Unconfined(_)), "{failure:?}");
+        assert_eq!(
+            failure.to_string(),
+            "unconfined: sandbox: Landlock is not supported"
+        );
+    }
+
+    /// Any end but those the child's exit codes say is a crash, whether
     /// the decoder aborted, the system killed it, or another program exited.
     #[tokio::test]
     async fn tells_a_crash_from_an_unsupported_file() {
@@ -573,6 +620,21 @@ mod tests {
     fn the_server_gives_each_child_15_seconds() {
         let thumbnailer = Thumbnailer::own_binary().unwrap();
         assert_eq!(thumbnailer.timeout, Duration::from_secs(15));
+    }
+
+    /// On macOS the server starts its children confined, through
+    /// `sandbox-exec` by its full path, around this very program.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_server_starts_its_children_confined() {
+        let thumbnailer = Thumbnailer::own_binary().unwrap();
+        assert_eq!(thumbnailer.program, Path::new("/usr/bin/sandbox-exec"));
+        #[expect(clippy::disallowed_methods, reason = "compares with this program")]
+        let this_program = std::env::current_exe().unwrap();
+        assert_eq!(
+            thumbnailer.args.last(),
+            Some(&this_program.into_os_string())
+        );
     }
 
     /// The server's children are the server's own binary: in tests, the test

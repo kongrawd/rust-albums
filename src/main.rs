@@ -60,7 +60,7 @@ fn env_required(name: &str) -> Result<String, String> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if env::args_os()
         .nth(1)
         .is_some_and(|arg| arg == "--thumbnail")
