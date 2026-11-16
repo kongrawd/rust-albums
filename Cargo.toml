@@ -10,8 +10,9 @@ axum = { version = "0.8", default-features = false, features = ["http1", "http2"
 axum-server = { version = "0.9", features = ["tls-rustls-no-provider"] }
 # Cookie and Basic-auth header parsing.
 axum-extra = { version = "0.12", default-features = false, features = ["cookie", "typed-header"] }
-# "process": thumbnails are decoded in a child process; it adds no crates.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "time", "io-util", "process"] }
+# "process" and "sync": thumbnails are decoded in child processes, a few at a
+# time; they add no crates.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "time", "io-util", "process", "sync"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 # Gzip only: brotli would add about 1 MB to the binary for a few percent smaller pages.
 tower-http = { version = "0.7", default-features = false, features = ["fs", "set-header", "compression-gzip"] }

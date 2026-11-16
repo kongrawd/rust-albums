@@ -42,6 +42,9 @@ const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(1);
 
 /// The placeholder that gives an album its name.
 pub const ALBUM_NAME_PLACEHOLDER: &str = "album_name";
+/// The type MP4, M4V and QuickTime originals are served as: they are all MP4
+/// inside (see [`content_type`]).
+pub const MP4: &str = "video/mp4";
 
 pub struct Library {
     /// Canonicalized, so containment checks compare like with like.
@@ -179,7 +182,7 @@ pub fn content_type(file_name: &str) -> Option<&'static str> {
     match mime_guess::from_path(path).first_raw()? {
         image @ ("image/jpeg" | "image/png" | "image/apng" | "image/gif" | "image/webp"
         | "image/avif" | "image/jxl" | "image/bmp" | "image/svg+xml") => Some(image),
-        "video/mp4" | "video/x-m4v" | "video/quicktime" => Some("video/mp4"),
+        MP4 | "video/x-m4v" | "video/quicktime" => Some(MP4),
         "video/webm" => Some("video/webm"),
         _ => None,
     }

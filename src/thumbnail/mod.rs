@@ -12,9 +12,20 @@ pub mod mp4;
 pub mod picture;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod sandbox;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod service;
 pub mod video;
 
 use std::{fmt, io};
+
+/// Whether the item `file_name` has a thumbnail: a video the reader reads,
+/// MP4 or QuickTime (served as [`library::MP4`](crate::library::MP4)), where
+/// thumbnails are made at all: Linux and macOS. Photos show their original
+/// instead; WebM has none.
+pub fn has_thumbnail(file_name: &str) -> bool {
+    cfg!(any(target_os = "linux", target_os = "macos"))
+        && crate::library::content_type(file_name) == Some(crate::library::MP4)
+}
 
 /// The largest picture a thumbnail is made from, 4096 × 2304 (above 4K UHD
 /// and DCI 4K). It bounds the memory decoding takes: about 100 MB for 4K
@@ -104,18 +115,4 @@ pub enum Orientation {
 
 /// Helpers shared by the tests of every step.
 #[cfg(test)]
-mod testing {
-    /// Decodes a thumbnail: its width, height and RGB pixels. It must be a
-    /// baseline JPEG in colour.
-    pub fn decode_jpeg(jpeg: &[u8]) -> (usize, usize, Vec<u8>) {
-        let mut decoder = jpeg_decoder::Decoder::new(jpeg);
-        let pixels = decoder.decode().unwrap();
-        let info = decoder.info().unwrap();
-        assert_eq!(info.pixel_format, jpeg_decoder::PixelFormat::RGB24);
-        assert_eq!(
-            info.coding_process,
-            jpeg_decoder::CodingProcess::DctSequential
-        );
-        (usize::from(info.width), usize::from(info.height), pixels)
-    }
-}
+pub mod testing;

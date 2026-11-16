@@ -13,6 +13,7 @@ use std::fmt;
 use std::fs::{File, Metadata};
 use std::io::{self, Write};
 use std::os::fd::AsFd;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -26,6 +27,8 @@ const UNCONFINED: i32 = 71;
 /// isn't a regular file), or writing the thumbnail did.
 const IO_ERROR: i32 = 74;
 
+/// The signal the out-of-memory killer sends, 9 on Linux and macOS alike.
+const SIGKILL: i32 = 9;
 /// The most a child may write as a thumbnail. The largest thumbnail is of a
 /// picture of [`MAX_PIXELS`](super::MAX_PIXELS) too narrow to shrink (400 px
 /// or less on its short side), in pure noise: 6.3 MB, measured once.
@@ -37,12 +40,20 @@ const MAX_MESSAGE: usize = 4 << 10;
 /// How long a killed child is waited for. One stuck in the kernel (a dead
 /// network mount) can outlive SIGKILL; tokio reaps it once it ends.
 const REAP_LIMIT: Duration = Duration::from_secs(1);
+/// The argument that makes this binary the child, read first in `main`.
+pub const MODE: &str = "--thumbnail";
+/// The argument that lets the child decode where it can't be confined.
+pub const ALLOW_UNCONFINED: &str = "--allow-unconfined";
+/// How many bytes of a file's SHA-256 tell builds apart (see [`build`]).
+const BUILD_ID_BYTES: usize = 8;
 
 /// The child's `main`: makes the thumbnail and returns the exit code. It runs
 /// before anything else in the binary: no config, runtime or environment. It
 /// stays single-threaded, so it runs as a container's only process under
 /// `--pids-limit 1` (checked by hand in Docker; no test can count threads).
-pub fn run() -> i32 {
+/// With `allow_unconfined`, the owner's opt-in, it decodes even where it
+/// can't confine itself.
+pub fn run(allow_unconfined: bool) -> i32 {
     // On Linux, be the process the out-of-memory killer picks rather than
     // the server. Any process may raise its own score. Checked by hand
     // (strace in Docker); no test can see it.
@@ -52,11 +63,18 @@ pub fn run() -> i32 {
         // From here on it reaches only its stdin, stdout and stderr; on
         // macOS the server started it confined. That it confines itself is
         // checked by hand (strace in Docker); tests check what it denies.
-        if let Err(err) = super::sandbox::confine() {
+        // With the opt-in it carries on unconfined (checked by hand in
+        // Docker with Landlock blocked; no test can take Landlock away).
+        if let Err(err) = super::sandbox::confine()
+            && !allow_unconfined
+        {
             eprintln!("sandbox: {err}");
             return UNCONFINED;
         }
     }
+    // On macOS the server confines it, so there is nothing to opt out of.
+    #[cfg(target_os = "macos")]
+    let _ = allow_unconfined;
     match thumbnail() {
         Ok(jpeg) => {
             let mut stdout = io::stdout().lock();
@@ -93,13 +111,23 @@ fn thumbnail() -> Result<Vec<u8>, Error> {
 /// the server's user. The child is the containment: it keeps the server
 /// running. What keeps originals safe is that the photos are mounted
 /// read-only in Docker.
-pub struct Original(File);
+pub struct Original {
+    file: File,
+    metadata: Metadata,
+}
 
 impl Original {
     /// Opens `path` read-only, if it is a regular file. Blocking, and it waits
     /// forever on a named pipe, so callers limit its time.
     pub fn open(path: &Path) -> io::Result<Self> {
-        regular_file(File::open(path)?).map(|(file, _)| Self(file))
+        let (file, metadata) = regular_file(File::open(path)?)?;
+        Ok(Self { file, metadata })
+    }
+
+    /// What the file was when opened: its size and when it was last changed
+    /// tell one version of an original from the next.
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
     }
 }
 
@@ -109,6 +137,8 @@ pub struct Thumbnailer {
     /// What comes before `--thumbnail` (the sandbox's, on macOS).
     args: Vec<OsString>,
     timeout: Duration,
+    /// The owner's opt-in to decode where a child can't be confined.
+    allow_unconfined: bool,
 }
 
 /// Why a child gave no thumbnail.
@@ -124,10 +154,12 @@ pub enum Failure {
     Unsupported(String),
     /// The child couldn't read the file, so the storage may be at fault.
     Io(String),
-    /// The child ended any other way: a decoder bug aborted it, the system
-    /// killed it (e.g. out of memory), or it wasn't our child. How it ended,
-    /// and what it said.
+    /// The child ended any other way: a decoder bug aborted it, or it wasn't
+    /// our child. How it ended, and what it said.
     Crashed(String),
+    /// Someone else killed the child: the out-of-memory killer, say, which
+    /// may be the host's trouble rather than the file's. How it ended.
+    Killed(String),
     /// The child took longer than the time limit, and was killed.
     TimedOut,
     /// The child wrote something other than a thumbnail: what was wrong.
@@ -142,6 +174,7 @@ impl fmt::Display for Failure {
             Self::Unsupported(why) => write!(f, "unsupported: {why}"),
             Self::Io(why) => write!(f, "i/o error: {why}"),
             Self::Crashed(why) => write!(f, "crashed: {why}"),
+            Self::Killed(why) => write!(f, "killed: {why}"),
             Self::TimedOut => f.write_str("timed out"),
             Self::BadOutput(why) => write!(f, "bad output: {why}"),
         }
@@ -156,17 +189,14 @@ impl Thumbnailer {
     /// child can't confine itself there.
     pub fn own_binary() -> io::Result<Self> {
         #[cfg(target_os = "linux")]
-        let (program, args) = (PathBuf::from("/proc/self/exe"), Vec::new());
+        let (program, args) = (this_program()?, Vec::new());
         #[cfg(target_os = "macos")]
-        let (program, args) = {
-            #[expect(clippy::disallowed_methods, reason = "where /proc/self/exe isn't")]
-            let this_program = std::env::current_exe()?;
-            super::sandbox::seatbelt(&this_program)
-        };
+        let (program, args) = super::sandbox::seatbelt(&this_program()?);
         Ok(Self {
             program,
             args,
             timeout: TIME_LIMIT,
+            allow_unconfined: false,
         })
     }
 
@@ -176,6 +206,16 @@ impl Thumbnailer {
             program: program.into(),
             args: Vec::new(),
             timeout,
+            allow_unconfined: false,
+        }
+    }
+
+    /// The same, letting children decode where they can't be confined, if
+    /// `allowed`: the `[thumbnails] allow_unconfined` setting.
+    pub fn allowing_unconfined(self, allowed: bool) -> Self {
+        Self {
+            allow_unconfined: allowed,
+            ..self
         }
     }
 
@@ -186,9 +226,10 @@ impl Thumbnailer {
         let mut command = tokio::process::Command::new(&self.program);
         let mut child = command
             .args(&self.args)
-            .arg("--thumbnail")
+            .arg(MODE)
+            .args(self.allow_unconfined.then_some(ALLOW_UNCONFINED))
             .env_clear()
-            .stdin(original.0)
+            .stdin(original.file)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // Also when the thumbnail is given up on before the child ends.
@@ -243,12 +284,38 @@ impl Thumbnailer {
             Some(UNSUPPORTED) => Err(Failure::Unsupported(why())),
             Some(UNCONFINED) => Err(Failure::Unconfined(why())),
             Some(IO_ERROR) => Err(Failure::Io(why())),
+            _ if status.signal() == Some(SIGKILL) => Err(Failure::Killed(status.to_string())),
             _ => Err(Failure::Crashed(match why() {
                 why if why.is_empty() => status.to_string(),
                 why => format!("{status}: {why}"),
             })),
         }
     }
+}
+
+/// The running program's file: on Linux `/proc/self/exe`, which still finds
+/// it after an upgrade replaced the file on disk.
+fn this_program() -> io::Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    return Ok(PathBuf::from("/proc/self/exe"));
+    #[cfg(target_os = "macos")]
+    #[expect(clippy::disallowed_methods, reason = "where /proc/self/exe isn't")]
+    std::env::current_exe()
+}
+
+/// Which build is running: [`file_id`] of this program. Reads the whole
+/// binary (a few MB), so is taken once, at start.
+pub fn build() -> io::Result<String> {
+    file_id(&this_program()?)
+}
+
+/// A file told by its contents: the first 8 bytes of their SHA-256, in hex.
+fn file_id(path: &Path) -> io::Result<String> {
+    let digest = crate::crypto::sha256(&std::fs::read(path)?);
+    Ok(digest[..BUILD_ID_BYTES]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// Whether `bytes` look like a whole JPEG: its start marker and a marker's
@@ -299,79 +366,8 @@ fn stdin_file() -> io::Result<File> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::testing::{JPEG, fake};
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
-    use std::sync::OnceLock;
-
-    const JPEG: &[u8] = b"\xFF\xD8\xFF\xE0 a thumbnail \xFF\xD9";
-    /// The folder of fake children, written once (see [`fake`]).
-    static FAKES: OnceLock<tempfile::TempDir> = OnceLock::new();
-
-    /// Stand-ins for the child, as shell scripts. All are written before any
-    /// test starts one: a script still open for writing when another thread
-    /// forks can't be run ("text file busy").
-    fn fake(name: &str) -> PathBuf {
-        let dir = FAKES.get_or_init(|| {
-            let dir = tempfile::tempdir().unwrap();
-            for (name, script) in [
-                // Writes back the "video", so tests choose the output.
-                ("echo", "cat"),
-                ("unsupported", "echo 'damaged file' >&2; exit 65"),
-                // Quotes, a backslash, a tab and a byte that isn't UTF-8.
-                ("garbles", r#"printf 'say "hi" \\ \377\tend\n' >&2; exit 65"#),
-                // A message that tries to add a line of its own to the log.
-                (
-                    "forges",
-                    "printf 'damaged\\nthumbnail abc: made\\n' >&2; exit 65",
-                ),
-                ("unreadable", "echo 'Input/output error' >&2; exit 74"),
-                (
-                    "unconfined",
-                    "echo 'sandbox: Landlock is not supported' >&2; exit 71",
-                ),
-                // A decoder bug under `panic = "abort"`.
-                ("aborts", "echo 'decoder bug' >&2; kill -ABRT $$"),
-                // As the out-of-memory killer does.
-                ("killed", "kill -KILL $$"),
-                // A panic in a test build, or another program's exit code.
-                ("exits", "echo 'decoder bug' >&2; exit 101"),
-                // Says which process it is, then never ends.
-                ("hangs", "echo $$ > \"$0.pid\"; exec sleep 30"),
-                // The same, for another test: each needs its own pid file.
-                ("lingers", "echo $$ > \"$0.pid\"; exec sleep 30"),
-                // Tries to change the video it was given.
-                ("tampers", "printf tampered >&0 || exit 74"),
-                // A JPEG start, then output without end.
-                ("floods", "printf '\\377\\330\\377'; exec cat /dev/zero"),
-                ("chatters", "echo 'not a picture'"),
-                // A JPEG of as many bytes as its "video" says, then what else
-                // it says, then success.
-                (
-                    "sized",
-                    "set -- $(cat); printf '\\377\\330\\377'; head -c $(($1 - 5)) /dev/zero; printf '\\377\\331%s' \"${2:-}\"",
-                ),
-                // Floods too, but ignores the closed pipe and carries on.
-                (
-                    "persists",
-                    "trap '' PIPE; printf '\\377\\330\\377'; cat /dev/zero; exec sleep 30",
-                ),
-                // A long message, then exit 65 only if all of it was written,
-                // as the child's `eprintln!` fails if it can't be.
-                (
-                    "rambles",
-                    "head -c 100000 /dev/zero | tr '\\0' x >&2 && exit 65",
-                ),
-                // Its environment, as a "JPEG".
-                ("env", "printf '\\377\\330\\377'; env; printf '\\377\\331'"),
-            ] {
-                let path = dir.path().join(name);
-                std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-            dir
-        });
-        dir.path().join(name)
-    }
 
     /// Whether the fake child `name` (which wrote its pid to `name.pid`) still
     /// exists, zombie or not: `kill -0` finds both.
@@ -444,15 +440,11 @@ mod tests {
         );
     }
 
-    /// Any end but those the child's exit codes say is a crash, whether
-    /// the decoder aborted, the system killed it, or another program exited.
+    /// Any end but those the child's exit codes say is a crash, whether the
+    /// decoder aborted or another program exited; a kill is told apart below.
     #[tokio::test]
     async fn tells_a_crash_from_an_unsupported_file() {
-        for (fake_name, says) in [
-            ("aborts", "decoder bug"),
-            ("killed", ""),
-            ("exits", "decoder bug"),
-        ] {
+        for (fake_name, says) in [("aborts", "decoder bug"), ("exits", "decoder bug")] {
             let thumbnailer = Thumbnailer::new(fake(fake_name), Duration::from_secs(5));
             let failure = thumbnailer.thumbnail(original(JPEG)).await.unwrap_err();
             assert!(
@@ -465,6 +457,46 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    /// The owner's opt-in reaches the child as a flag, and only when given:
+    /// without it, a child that can't be confined refuses.
+    #[tokio::test]
+    async fn passes_the_opt_in_to_decode_unconfined() {
+        for (allowed, args) in [
+            (false, MODE.to_string()),
+            (true, format!("{MODE} {ALLOW_UNCONFINED}")),
+        ] {
+            let thumbnailer = Thumbnailer::new(fake("args"), Duration::from_secs(5));
+            let output = thumbnailer
+                .allowing_unconfined(allowed)
+                .thumbnail(original(b""))
+                .await
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&output[3..output.len() - 2]), args);
+        }
+    }
+
+    /// A file is told by its contents: the start of their SHA-256 (that of
+    /// "abc" from FIPS 180-2), the same for the same bytes.
+    #[test]
+    fn a_file_is_told_by_its_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let (abc, other) = (dir.path().join("abc"), dir.path().join("other"));
+        std::fs::write(&abc, b"abc").unwrap();
+        std::fs::write(&other, b"abd").unwrap();
+        assert_eq!(file_id(&abc).unwrap(), "ba7816bf8f01cfea");
+        assert_ne!(file_id(&other).unwrap(), file_id(&abc).unwrap());
+    }
+
+    /// A child killed by someone else (the out-of-memory killer, say) may be
+    /// the host's trouble rather than the file's: it is told from a crash.
+    #[tokio::test]
+    async fn tells_a_kill_from_a_crash() {
+        let thumbnailer = Thumbnailer::new(fake("killed"), Duration::from_secs(5));
+        let failure = thumbnailer.thumbnail(original(JPEG)).await.unwrap_err();
+        assert!(matches!(failure, Failure::Killed(_)), "{failure:?}");
+        assert!(failure.to_string().starts_with("killed: "), "{failure}");
     }
 
     /// A child that never ends is killed at the time limit, and waited for:

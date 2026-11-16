@@ -63,9 +63,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if env::args_os()
         .nth(1)
-        .is_some_and(|arg| arg == "--thumbnail")
+        .is_some_and(|arg| arg == thumbnail::child::MODE)
     {
-        std::process::exit(thumbnail::child::run());
+        let allow_unconfined = env::args_os()
+            .nth(2)
+            .is_some_and(|arg| arg == thumbnail::child::ALLOW_UNCONFINED);
+        std::process::exit(thumbnail::child::run(allow_unconfined));
     }
     rustls::crypto::ring::default_provider()
         .install_default()
