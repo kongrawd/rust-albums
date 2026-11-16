@@ -24,13 +24,6 @@ const ZIGZAG: [usize; 64] = [
     52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
-/// A Huffman table as stored in the file (Annex K.3): the number of codes of
-/// each length from 1 to 16 bits, then the symbols in code order.
-struct HuffmanSpec {
-    counts: [u8; 16],
-    symbols: &'static [u8],
-}
-
 const LUMA_DC: HuffmanSpec = HuffmanSpec {
     counts: [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
     symbols: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
@@ -71,6 +64,13 @@ const CHROMA_AC: HuffmanSpec = HuffmanSpec {
         0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
     ],
 };
+
+/// A Huffman table as stored in the file (Annex K.3): the number of codes of
+/// each length from 1 to 16 bits, then the symbols in code order.
+struct HuffmanSpec {
+    counts: [u8; 16],
+    symbols: &'static [u8],
+}
 
 /// Each symbol's code and code length (Annex C), indexed by symbol.
 struct Huffman {

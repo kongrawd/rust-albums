@@ -19,6 +19,7 @@ const MAX_INDEX: u64 = 32 << 20;
 const MAX_SAMPLE: u64 = 16 << 20;
 /// Bytes of a visual sample entry before its child boxes (§12.1.3).
 const VISUAL_SAMPLE_ENTRY: usize = 78;
+const DAMAGED: Error = Error::Unsupported(Reason::Damaged);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Codec {
@@ -38,8 +39,6 @@ pub struct Keyframe {
     /// store portrait video sideways.
     pub orientation: Orientation,
 }
-
-const DAMAGED: Error = Error::Unsupported(Reason::Damaged);
 
 /// The first keyframe of the first H.264 or HEVC video track in `file`, which
 /// is `len` bytes long.
