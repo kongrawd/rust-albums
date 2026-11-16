@@ -17,6 +17,9 @@ These terms mean the same thing in the code and the docs.
 | **item** | A media file in an album, matching the pattern's last segment. |
 | **original** | An item's file exactly as stored, served unchanged. |
 | **item page** | The page showing one item, with a link to its original. |
+| **thumbnail** | A small picture made from an item's original, shown instead of it in grids. Not "preview" or "poster". |
+| **tile** | An item's square in an album's grid: its thumbnail, or a photo's original while photos have none. |
+| **cover** | An album's picture on the album list: that of its first item that has one. |
 | **path** | Always `/`-separated and relative to the root (album path, item path). |
 | **link id** | The fixed-length id used in URLs instead of an album or item path. An item's page and its original share one. |
 | **page title** | A fixed string per page type. |
