@@ -20,3 +20,6 @@ link.key
 
 # Video thumbnails, made on the fly beside the local config; deleting them is safe.
 /thumbnails/
+
+# macOS Finder metadata.
+.DS_Store
