@@ -18,6 +18,7 @@ mod pattern;
 mod plain_http;
 mod routes;
 mod session;
+mod thumbnail;
 mod tls;
 mod web;
 
