@@ -8,7 +8,7 @@
 
 use crate::library::{ALBUM_NAME_PLACEHOLDER, Album, Item, MediaKind, Snapshot};
 use crate::pattern::Metadata;
-use crate::routes;
+use crate::{routes, thumbnail};
 use maud::{DOCTYPE, Escaper, Markup, PreEscaped, Render, html};
 use std::fmt::{self, Write as _};
 
@@ -178,11 +178,14 @@ fn item_tile(item: &Item) -> Markup {
 
 /// The URL of the image that tiles and album covers show for `item`, the one
 /// place deciding it (a video tile adds its play glyph on its own). A photo
-/// shows its original. A video shows none, as browsers can't lazy-load
-/// `<video>`, so nothing is fetched until it is opened.
+/// shows its original; a video its thumbnail, if it has one: never the video,
+/// as browsers can't lazy-load `<video>`.
 fn preview(item: &Item) -> Option<routes::Link<'_>> {
     match item.kind {
         MediaKind::Image => Some(routes::original_url(&item.id)),
+        MediaKind::Video if thumbnail::has_thumbnail(&item.path) => {
+            Some(routes::thumbnail_url(&item.id))
+        }
         MediaKind::Video => None,
     }
 }

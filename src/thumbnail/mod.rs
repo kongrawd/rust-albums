@@ -2,9 +2,6 @@
 //! Videos are decoded in a child process (see [`child`]), so a bug in a
 //! decoder aborts that process, never the server.
 
-// Wired into the server by the thumbnail route; until then only tests use it.
-#![allow(dead_code)]
-
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod child;
 mod jpeg;

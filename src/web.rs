@@ -85,8 +85,11 @@ pub fn router(state: AppState) -> Router {
         .layer(set_header(header::CACHE_CONTROL, NO_STORE))
         .layer(CompressionLayer::new().quality(CompressionLevel::Fastest));
 
-    let originals = Router::new()
-        .route(routes::ORIGINAL, get(serve_original))
+    let originals = Router::new().route(routes::ORIGINAL, get(serve_original));
+    // Thumbnails are small originals: the same sign-in and headers.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let originals = originals.route(routes::THUMBNAIL, get(serve_thumbnail));
+    let originals = originals
         .route_layer(sign_in_required)
         .layer(set_header(header::CONTENT_SECURITY_POLICY, ORIGINAL_CSP))
         .layer(set_header(header::CACHE_CONTROL, ORIGINAL_CACHE));
@@ -265,6 +268,42 @@ async fn serve_original(
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
 }
 
+/// An item's thumbnail: made the first time it is asked for and kept, then
+/// served as a file, conditional requests and all. Items with none answer 404,
+/// and their tiles keep their plain square.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn serve_thumbnail(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    request: Request,
+) -> Result<impl IntoResponse, StatusCode> {
+    use crate::thumbnail::{self, child::Original};
+    let thumbnails = state.thumbnails.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let item_path = state
+        .library
+        .item_path(&item_id)
+        .filter(|path| thumbnail::has_thumbnail(path))
+        .ok_or(StatusCode::NOT_FOUND)?;
+    // As for an original, a hung mount must not hang the request: finding
+    // the file and opening it share one time limit.
+    let open = async {
+        let file = state.library.item_file(&item_path).await?;
+        let open = tokio::task::spawn_blocking(move || Original::open(&file));
+        open.await.ok()?.ok()
+    };
+    let original = tokio::time::timeout(ORIGINAL_OPEN_TIMEOUT, open)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let made = thumbnails
+        .thumbnail(&item_id, original)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let jpeg = mime_guess::mime::IMAGE_JPEG;
+    let Ok(response) = ServeFile::new_with_mime(made, &jpeg).oneshot(request).await;
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +380,15 @@ mod tests {
         pattern: &str,
         files: &[(&str, &[u8])],
     ) -> (tempfile::TempDir, Router, LinkIds, access_log::Lines) {
+        app_over_with(pattern, files, true).await
+    }
+
+    /// [`app_over`], with or without thumbnails (as where none can be made).
+    async fn app_over_with(
+        pattern: &str,
+        files: &[(&str, &[u8])],
+        thumbnails: bool,
+    ) -> (tempfile::TempDir, Router, LinkIds, access_log::Lines) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("storage");
         std::fs::create_dir_all(&root).unwrap();
@@ -363,6 +411,12 @@ mod tests {
         };
         let library = Library::open(&storage, link_ids.clone()).await.unwrap();
         let log = Arc::new(Mutex::new(Vec::new()));
+        // Made by a child that writes back the video: tests choose it.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let thumbnails = thumbnails.then(|| {
+            let child = crate::thumbnail::testing::fake("echo");
+            crate::thumbnail::testing::service(child, Duration::from_secs(5), "test", dir.path()).0
+        });
         let router = router(Arc::new(App {
             library,
             credentials: Credentials::new("alice", "pw").unwrap(),
@@ -372,6 +426,8 @@ mod tests {
             })),
             hsts_max_age: Duration::from_secs(60),
             access_log: access_log::AccessLog::Memory(log.clone()),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            thumbnails,
         }));
         (dir, router, link_ids, log)
     }
@@ -627,11 +683,12 @@ mod tests {
     }
 
     /// A photo tile shows its original, loaded lazily; a video tile shows its
-    /// name and a play glyph but no `<video>`, so nothing is fetched until it
-    /// is opened.
+    /// thumbnail, lazily too, under a play glyph, but no `<video>`, so the
+    /// video isn't fetched until it is opened.
     #[tokio::test]
     async fn album_pages_fetch_media_only_when_needed() {
         let (_root, app, links) = app().await;
+        let video_id = links.ids.item("Trip/b.mp4");
         let cookie = session_cookie(&app).await;
         let html = body_text(send(&app, open(&links.album, Some(&cookie))).await).await;
         let photo = format!(
@@ -639,8 +696,10 @@ mod tests {
             links.photo_page, links.photo
         );
         let video = format!(
-            r#"<a class="tile" href="{}" title="b.mp4"><span class="play" aria-hidden="true">▶{}</span><span class="caption">b.mp4</span></a>"#,
-            links.video_page, '\u{FE0E}'
+            r#"<a class="tile" href="{}" title="b.mp4"><img loading="lazy" src="{}" alt=""><span class="play" aria-hidden="true">▶{}</span><span class="caption">b.mp4</span></a>"#,
+            links.video_page,
+            routes::thumbnail_url(&video_id),
+            '\u{FE0E}'
         );
         assert!(html.contains(&photo), "{html}");
         assert!(html.contains(&video), "{html}");
@@ -666,8 +725,9 @@ mod tests {
                 routes::original_url(&photo_id)
             ),
             format!(
-                r#"<a class="tile" href="{}" title="002_clip.mp4 · seq: 002"><span class="play" aria-hidden="true">▶{}</span><span class="caption">002_clip.mp4</span></a>"#,
+                r#"<a class="tile" href="{}" title="002_clip.mp4 · seq: 002"><img loading="lazy" src="{}" alt=""><span class="play" aria-hidden="true">▶{}</span><span class="caption">002_clip.mp4</span></a>"#,
                 routes::item_page_url(&video_id),
+                routes::thumbnail_url(&video_id),
                 '\u{FE0E}'
             ),
         ];
@@ -685,26 +745,29 @@ mod tests {
         }
     }
 
-    /// An album's cover is its first photo, loaded lazily, even after a video;
-    /// an album of only videos gets an empty cover.
+    /// An album's cover is the picture of its first item that has one, loaded
+    /// lazily: a photo's original or a video's thumbnail. A WebM video has no
+    /// thumbnail, so it is passed over; an album of those gets an empty cover.
     #[tokio::test]
-    async fn album_covers_show_the_first_photo() {
-        let (_dir, app, links, _log) =
-            app_with_files(&["Clips/c.mp4", "Mix/0.mp4", "Mix/1.svg", "Mix/2.svg"]).await;
+    async fn album_covers_show_the_first_picture() {
+        let files = ["Clips/c.mp4", "Mix/0.webm", "Mix/1.svg", "Web/w.webm"];
+        let (_dir, app, links, _log) = app_with_files(&files).await;
         let cookie = session_cookie(&app).await;
         let html = body_text(send(&app, open(routes::HOME, Some(&cookie))).await).await;
-        let cover = |album: &str, photo: Option<&str>| {
-            let img = photo.map_or(String::new(), |photo| {
-                let src = routes::original_url(&links.ids.item(photo)).to_string();
+        let cover = |album: &str, src: Option<String>| {
+            let img = src.map_or(String::new(), |src| {
                 format!(r#"<img loading="lazy" src="{src}" alt="">"#)
             });
             let href = routes::album_url(&links.ids.album(album)).to_string();
             format!(r#"<a class="album" href="{href}"><div class="cover">{img}</div>"#)
         };
+        let original = |item| Some(routes::original_url(&links.ids.item(item)).to_string());
+        let thumbnail = |item| Some(routes::thumbnail_url(&links.ids.item(item)).to_string());
         for expected in [
-            cover("Trip", Some("Trip/a.svg")),
-            cover("Mix", Some("Mix/1.svg")),
-            cover("Clips", None),
+            cover("Trip", original("Trip/a.svg")),
+            cover("Clips", thumbnail("Clips/c.mp4")),
+            cover("Mix", original("Mix/1.svg")),
+            cover("Web", None),
         ] {
             assert!(html.contains(&expected), "{expected}\n{html}");
         }
@@ -805,6 +868,52 @@ mod tests {
                 "{url}"
             );
         }
+    }
+
+    /// A video's thumbnail is a JPEG for signed-in users, made the first time
+    /// and kept: asked again unchanged, it costs a 304. A photo, a WebM video
+    /// or a video with no thumbnail answers 404, so its tile keeps its plain
+    /// square and play glyph.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn video_tiles_load_their_thumbnails() {
+        let files = [
+            ("Trip/a.svg", &b"<svg/>"[..]),
+            ("Trip/b.mp4", crate::thumbnail::testing::JPEG),
+            ("Trip/c.mp4", &VIDEO[..]),
+            // Has a JPEG in it too: only the kind of file keeps it from one.
+            ("Trip/d.webm", crate::thumbnail::testing::JPEG),
+        ];
+        let (_dir, app, ids, _log) = app_over("{album_name}/{file_name}", &files).await;
+        let thumbnail = |path: &str| routes::thumbnail_url(&ids.item(path)).to_string();
+
+        let response = send(&app, open(&thumbnail("Trip/b.mp4"), None)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let cookie = session_cookie(&app).await;
+        let response = send(&app, open(&thumbnail("Trip/b.mp4"), Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header_of(&response, header::CONTENT_TYPE), "image/jpeg");
+        let modified = header_of(&response, header::LAST_MODIFIED).to_string();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], crate::thumbnail::testing::JPEG);
+        let again = open(&thumbnail("Trip/b.mp4"), Some(&cookie))
+            .header(header::IF_MODIFIED_SINCE, modified);
+        assert_eq!(send(&app, again).await.status(), StatusCode::NOT_MODIFIED);
+
+        for none in ["Trip/a.svg", "Trip/c.mp4", "Trip/d.webm"] {
+            let response = send(&app, open(&thumbnail(none), Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{none}");
+        }
+
+        // Where none can be made, a video's tile keeps its plain square too.
+        let (_dir, off, ids, _log) = app_over_with("{album_name}/{file_name}", &files, false).await;
+        let cookie = session_cookie(&off).await;
+        let url = routes::thumbnail_url(&ids.item("Trip/b.mp4")).to_string();
+        let response = send(&off, open(&url, Some(&cookie))).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// Pages are gzipped for browsers that accept it (a large album page

@@ -23,6 +23,7 @@ Start with the server's log (`docker compose logs albums` in Docker): startup er
 | Pages say "Storage is unavailable" | The disk or share dropped out (`/healthz` names the reason). The last albums stay visible, and it recovers on its own once the storage is back. |
 | New photos don't show | Wait for the next scan, after the files have stopped changing (`rescan_secs`, `settle_secs`). Files must match the pattern; a scan that finds no albums logs a hint. |
 | A video doesn't play | The browser can't decode its codec. HEVC (H.265) plays in Safari but only on some Chrome and Edge setups; H.264 or VP9 play almost everywhere. |
+| A video has no thumbnail | Only MP4 and QuickTime videos in H.264 or HEVC get one. If no video has one, the host may lack the sandbox they are made in: [video thumbnails](configuration.md#video-thumbnails). |
 | AirPlay doesn't play a video | The Apple TV can't sign in, so it is refused. Play it on the phone or computer instead. |
 | "A proxy sends plain HTTP" | Point the reverse proxy at `https://`. |
 | No way past the warning for a self-signed certificate | The browser refuses that certificate. Remove both certificate files to have a new one generated, see [configuration.md](configuration.md#certificates). |

@@ -17,3 +17,6 @@ link.key
 
 # codegraph code-intelligence index (rebuild with `codegraph index`).
 .codegraph/
+
+# Video thumbnails, made on the fly beside the local config; deleting them is safe.
+/thumbnails/

@@ -1,6 +1,6 @@
 # rust-albums (POC)
 
-A small, self-hosted photo and video album viewer. Point it at a folder of photos and it serves them as albums over **HTTPS only**, behind a sign-in. It is a single ~3 MB binary and runs on a Raspberry Pi, a NAS or any Linux, macOS or Docker host (amd64, arm64 and armv7).
+A small, self-hosted photo and video album viewer. Point it at a folder of photos and it serves them as albums over **HTTPS only**, behind a sign-in. It is a single ~5 MB binary and runs on a Raspberry Pi, a NAS or any Linux, macOS or Docker host (amd64, arm64 and armv7).
 
 - **Albums from folders:** you describe your folder layout with a pattern such as `{year}/{album_name}/{file_name}`, and each `{…}` part becomes metadata.
 - **Sign in, sign out:** one account, set in the environment. Signing out really signs you out, and every page and file link checks your session.
@@ -75,13 +75,13 @@ Common problems, from a missing marker file to videos that don't play: [docs/tro
 
 - **Run one copy only:** sign-ins are kept in memory ([details](docs/architecture.md#single-replica)).
 - One account, shared by everyone who knows the credentials.
-- No thumbnails: originals are loaded lazily as you scroll.
+- Thumbnails for videos only (MP4 and QuickTime); photos load their originals lazily as you scroll.
 - Renaming or moving a file or album changes its URL, so old links to it stop working.
 - Certificates are read at startup ([renewals](docs/configuration.md#certificates)).
 
 ## Documentation
 
-- [docs/configuration.md](docs/configuration.md): the config file, environment overrides, certificates
+- [docs/configuration.md](docs/configuration.md): the config file, environment overrides, certificates, video thumbnails
 - [docs/storage.md](docs/storage.md): patterns, the marker file, storage outages, album URLs
 - [docs/security.md](docs/security.md): HTTPS, signing in and out, direct links, routes
 - [docs/docker.md](docs/docker.md): Compose, settings, permissions, upgrading

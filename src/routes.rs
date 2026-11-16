@@ -14,10 +14,13 @@ pub const ALBUM: &str = "/albums/{album_id}";
 pub const ORIGINAL: &str = "/media/{item_id}";
 /// Router pattern matched by [`item_page_url`]: the same link id as [`ORIGINAL`].
 pub const ITEM_PAGE: &str = "/items/{item_id}";
+/// Router pattern matched by [`thumbnail_url`]: the same link id as [`ORIGINAL`].
+pub const THUMBNAIL: &str = "/thumbnails/{item_id}";
 
 const ALBUM_PREFIX: &str = "/albums/";
 const ORIGINAL_PREFIX: &str = "/media/";
 const ITEM_PAGE_PREFIX: &str = "/items/";
+const THUMBNAIL_PREFIX: &str = "/thumbnails/";
 
 /// Characters left unescaped when encoding (RFC 3986 "unreserved").
 const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
@@ -65,6 +68,14 @@ pub fn item_page_url(item_id: &str) -> Link<'_> {
     }
 }
 
+/// An item's thumbnail, for items that have one (see `thumbnail::has_thumbnail`).
+pub fn thumbnail_url(item_id: &str) -> Link<'_> {
+    Link {
+        prefix: THUMBNAIL_PREFIX,
+        id: item_id,
+    }
+}
+
 /// The sign-in form, set to return to `target` (a local URL) afterwards.
 pub fn sign_in_url(target: &str) -> String {
     format!("{SIGN_IN}?next={}", utf8_percent_encode(target, UNRESERVED))
@@ -94,9 +105,14 @@ mod tests {
         assert!(ALBUM.starts_with(ALBUM_PREFIX));
         assert!(ORIGINAL.starts_with(ORIGINAL_PREFIX));
         assert!(ITEM_PAGE.starts_with(ITEM_PAGE_PREFIX));
+        assert!(THUMBNAIL.starts_with(THUMBNAIL_PREFIX));
         assert_eq!(album_url("q2bMf0-_x").to_string(), "/albums/q2bMf0-_x");
         assert_eq!(original_url("q2bMf0-_x").to_string(), "/media/q2bMf0-_x");
         assert_eq!(item_page_url("q2bMf0-_x").to_string(), "/items/q2bMf0-_x");
+        assert_eq!(
+            thumbnail_url("q2bMf0-_x").to_string(),
+            "/thumbnails/q2bMf0-_x"
+        );
         assert_eq!(
             sign_in_url("/albums/a?x=1"),
             "/login?next=%2Falbums%2Fa%3Fx%3D1"

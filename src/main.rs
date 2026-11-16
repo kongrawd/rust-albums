@@ -36,6 +36,9 @@ pub struct App {
     pub sessions: Arc<session::Sessions>,
     pub hsts_max_age: Duration,
     pub access_log: access_log::AccessLog,
+    /// Video thumbnails, unless the platform can't make any.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub thumbnails: Option<thumbnail::service::Thumbnails>,
 }
 
 /// Time given to in-flight requests on shutdown.
@@ -89,12 +92,58 @@ fn main() -> Result<(), Box<dyn Error>> {
         .enable_all()
         .max_blocking_threads(MAX_BLOCKING_THREADS)
         .build()?;
-    let result = runtime.block_on(serve(config));
+    // Before the runtime starts: it reads the whole binary, once.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let thumbnails = thumbnails(&config.thumbnails);
+    let result = runtime.block_on(serve(
+        config,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        thumbnails,
+    ));
     runtime.shutdown_timeout(BLOCKING_SHUTDOWN);
     result
 }
 
-async fn serve(config: config::Config) -> Result<(), Box<dyn Error>> {
+/// Video thumbnails, made by children of this very binary, or `None`, said
+/// once, if they can't be started here.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn thumbnails(settings: &config::Thumbnails) -> Option<thumbnail::service::Thumbnails> {
+    use thumbnail::{child, service};
+    let start = || -> std::io::Result<_> {
+        let made_by = child::Thumbnailer::own_binary()?;
+        Ok((
+            made_by.allowing_unconfined(settings.allow_unconfined),
+            child::build()?,
+        ))
+    };
+    match start() {
+        Ok((made_by, build)) => {
+            let dir = &settings.dir;
+            let unconfined = if settings.allow_unconfined {
+                ", unsandboxed where the sandbox can't be had"
+            } else {
+                ""
+            };
+            eprintln!(
+                "thumbnails in {} (build {build}){unconfined}",
+                dir.display()
+            );
+            let log = service::AuditLog::Stderr;
+            Some(service::Thumbnails::new(dir.clone(), made_by, build, log))
+        }
+        Err(err) => {
+            eprintln!("thumbnails off: {err}");
+            None
+        }
+    }
+}
+
+async fn serve(
+    config: config::Config,
+    #[cfg(any(target_os = "linux", target_os = "macos"))] thumbnails: Option<
+        thumbnail::service::Thumbnails,
+    >,
+) -> Result<(), Box<dyn Error>> {
     let library = match config.storage.backend {
         config::StorageBackend::Local => {
             let link_ids = link_ids::LinkIds::load_or_create(&config.storage.link_key)?;
@@ -125,6 +174,8 @@ async fn serve(config: config::Config) -> Result<(), Box<dyn Error>> {
         sessions,
         hsts_max_age: config.tls.hsts_max_age,
         access_log: access_log::AccessLog::Stdout,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        thumbnails,
     }));
 
     let handle = Handle::new();

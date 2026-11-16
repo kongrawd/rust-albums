@@ -29,6 +29,7 @@ pub struct Config {
     pub storage: Storage,
     pub tls: Tls,
     pub session: Session,
+    pub thumbnails: Thumbnails,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +81,15 @@ pub struct Session {
     pub idle_timeout: Duration,
     #[serde(rename = "max_lifetime_secs", deserialize_with = "seconds")]
     pub max_lifetime: Duration,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Thumbnails {
+    /// Where thumbnails are cached; anything in it can be made again.
+    pub dir: PathBuf,
+    /// Whether children may decode unconfined where the sandbox can't be had.
+    pub allow_unconfined: bool,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -242,6 +252,7 @@ impl Config {
             &mut self.storage.link_key,
             &mut self.tls.cert,
             &mut self.tls.key,
+            &mut self.thumbnails.dir,
         ] {
             if path.is_relative() {
                 let relative = path.strip_prefix(".").unwrap_or(path);
@@ -386,6 +397,20 @@ mod tests {
         assert_eq!(config.session.idle_timeout, defaults.session.idle_timeout);
         assert_eq!(config.session.max_lifetime, defaults.session.max_lifetime);
         assert_eq!(fs::read_to_string(&path).unwrap(), older);
+    }
+
+    /// Thumbnails go beside the config, as the link key does, and children
+    /// are never run unconfined unless the owner asks; a config from before
+    /// thumbnails gets both.
+    #[test]
+    fn thumbnails_are_kept_beside_the_config_and_confined() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("albums.toml");
+        let (before, _) = DEFAULT_CONFIG_TOML.split_once("[thumbnails]").unwrap();
+        fs::write(&path, before).unwrap();
+        let config = Config::load_or_create(&path).unwrap();
+        assert_eq!(config.thumbnails.dir, dir.path().join("thumbnails"));
+        assert!(!config.thumbnails.allow_unconfined);
     }
 
     #[cfg(unix)]

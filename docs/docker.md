@@ -1,6 +1,6 @@
 # Docker
 
-The image runs as a non-root user (uid 65532) on distroless. Photos are mounted read-only at `/photos`, and everything the server writes (the config, the self-signed certificate and the link key) goes to `/state`.
+The image runs as a non-root user (uid 65532) on distroless. Photos are mounted read-only at `/photos`, and everything the server writes (the config, the self-signed certificate, the link key and video thumbnails) goes to `/state`.
 
 ## Compose
 

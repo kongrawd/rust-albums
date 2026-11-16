@@ -31,3 +31,9 @@ Mainly for containers. Empty values are ignored, and relative paths are resolved
 - **certbot:** mount the whole `/etc/letsencrypt` folder: `live/` holds symlinks into `archive/`.
 - **Permissions:** the server must be able to read the key; in Docker, see [docker.md](docker.md#permissions).
 - **New names for the self-signed certificate:** it is generated once, so after changing `self_signed_names` (in Docker, `ALBUMS_TLS_NAMES`), delete the certificate and key and restart. In Docker, see [docker.md](docker.md#changing-the-state-volume).
+
+## Video thumbnails
+
+Video tiles show a thumbnail, made the first time it is needed and kept in `[thumbnails] dir` (`/state/thumbnails` in Docker). Deleting the folder is safe: missing thumbnails are made again. MP4 and QuickTime videos in H.264 or HEVC, up to 4096 × 2304, get one; other videos show a play symbol.
+
+Thumbnails are made in a sandbox, which on Linux needs Landlock (Linux 5.13 or later). Raspberry Pi OS's kernel doesn't have it, so no thumbnails are made there. Either set `allow_unconfined = true` to make them without the sandbox, or use a distribution whose kernel has Landlock, such as Ubuntu for Raspberry Pi or Debian 13.
