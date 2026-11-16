@@ -3,7 +3,9 @@
 // Wired into the server by the thumbnail route; until then only tests use it.
 #![allow(dead_code)]
 
+mod jpeg;
 pub mod mp4;
+pub mod picture;
 
 use std::{fmt, io};
 
@@ -85,4 +87,22 @@ pub enum Orientation {
     UpsideDown,
     /// Turned a quarter anticlockwise to show it upright.
     TurnedLeft,
+}
+
+/// Helpers shared by the tests of every step.
+#[cfg(test)]
+mod testing {
+    /// Decodes a thumbnail: its width, height and RGB pixels. It must be a
+    /// baseline JPEG in colour.
+    pub fn decode_jpeg(jpeg: &[u8]) -> (usize, usize, Vec<u8>) {
+        let mut decoder = jpeg_decoder::Decoder::new(jpeg);
+        let pixels = decoder.decode().unwrap();
+        let info = decoder.info().unwrap();
+        assert_eq!(info.pixel_format, jpeg_decoder::PixelFormat::RGB24);
+        assert_eq!(
+            info.coding_process,
+            jpeg_decoder::CodingProcess::DctSequential
+        );
+        (usize::from(info.width), usize::from(info.height), pixels)
+    }
 }

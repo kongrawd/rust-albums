@@ -49,6 +49,8 @@ strip = true
 tempfile = "3"
 # Reads gzipped pages back (already in the tree via tower-http's compression).
 flate2 = "1"
+# Reads thumbnails back (image-rs's JPEG decoder); tests only, never in the binary.
+jpeg-decoder = { version = "0.3", default-features = false }
 tokio = { version = "1", features = ["test-util"] }
 
 [lints.clippy]
