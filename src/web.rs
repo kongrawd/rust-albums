@@ -283,6 +283,8 @@ mod tests {
         /// The pages showing the photo and the video.
         photo_page: String,
         video_page: String,
+        /// Link ids of the library, for items a test adds.
+        ids: LinkIds,
     }
 
     /// A router over a temporary library with one album, `Trip`, holding the
@@ -298,18 +300,20 @@ mod tests {
         app_with_files(&[]).await
     }
 
-    /// [`app_with_log`], with more videos (`VIDEO_LEN` zero bytes each) at
-    /// these item paths.
+    /// [`app_with_log`], with more items (`VIDEO_LEN` zero bytes each) at
+    /// these item paths, in any album; their folders are created.
     async fn app_with_files(
-        videos: &[&str],
+        items: &[&str],
     ) -> (tempfile::TempDir, Router, Links, access_log::Lines) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("storage");
         std::fs::create_dir_all(root.join("Trip")).unwrap();
         std::fs::write(root.join(".albums-root"), "").unwrap();
         std::fs::write(root.join("Trip/a.svg"), "<svg/>").unwrap();
-        for video in std::iter::once(&"Trip/b.mp4").chain(videos) {
-            std::fs::write(root.join(video), [0u8; VIDEO_LEN]).unwrap();
+        for item in std::iter::once(&"Trip/b.mp4").chain(items) {
+            let file = root.join(item);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, [0u8; VIDEO_LEN]).unwrap();
         }
         let link_ids = LinkIds::load_or_create(&dir.path().join("link.key")).unwrap();
         let (photo_id, video_id) = (link_ids.item("Trip/a.svg"), link_ids.item("Trip/b.mp4"));
@@ -319,6 +323,7 @@ mod tests {
             video: routes::original_url(&video_id),
             photo_page: routes::item_page_url(&photo_id),
             video_page: routes::item_page_url(&video_id),
+            ids: link_ids.clone(),
         };
         let storage = config::Storage {
             backend: config::StorageBackend::Local,
@@ -595,18 +600,50 @@ mod tests {
         }
     }
 
+    /// A photo tile shows its original, loaded lazily; a video tile shows its
+    /// name and a play glyph but no `<video>`, so nothing is fetched until it
+    /// is opened.
     #[tokio::test]
     async fn album_pages_fetch_media_only_when_needed() {
         let (_root, app, links) = app().await;
         let cookie = session_cookie(&app).await;
         let html = body_text(send(&app, open(&links.album, Some(&cookie))).await).await;
-        assert!(html.contains(&format!(r#"loading="lazy" src="{}""#, links.photo)));
-        // Browsers can't lazy-load `<video>`, so video tiles have none.
-        assert!(!html.contains("<video"), "{html}");
-        assert!(
-            html.contains("b.mp4"),
-            "the file name is shown, not only a tooltip"
+        let photo = format!(
+            r#"<a class="tile" href="{}" title="a.svg"><img loading="lazy" src="{}" alt=""><span class="caption">a.svg</span></a>"#,
+            links.photo_page, links.photo
         );
+        let video = format!(
+            r#"<a class="tile" href="{}" title="b.mp4"><span class="play" aria-hidden="true">▶{}</span><span class="caption">b.mp4</span></a>"#,
+            links.video_page, '\u{FE0E}'
+        );
+        assert!(html.contains(&photo), "{html}");
+        assert!(html.contains(&video), "{html}");
+        assert!(!html.contains("<video"), "{html}");
+    }
+
+    /// An album's cover is its first photo, loaded lazily, even after a video;
+    /// an album of only videos gets an empty cover.
+    #[tokio::test]
+    async fn album_covers_show_the_first_photo() {
+        let (_dir, app, links, _log) =
+            app_with_files(&["Clips/c.mp4", "Mix/0.mp4", "Mix/1.svg", "Mix/2.svg"]).await;
+        let cookie = session_cookie(&app).await;
+        let html = body_text(send(&app, open(routes::HOME, Some(&cookie))).await).await;
+        let cover = |album: &str, photo: Option<&str>| {
+            let img = photo.map_or(String::new(), |photo| {
+                let src = routes::original_url(&links.ids.item(photo));
+                format!(r#"<img loading="lazy" src="{src}" alt="">"#)
+            });
+            let href = routes::album_url(&links.ids.album(album));
+            format!(r#"<a class="album" href="{href}"><div class="cover">{img}</div>"#)
+        };
+        for expected in [
+            cover("Trip", Some("Trip/a.svg")),
+            cover("Mix", Some("Mix/1.svg")),
+            cover("Clips", None),
+        ] {
+            assert!(html.contains(&expected), "{expected}\n{html}");
+        }
     }
 
     /// What `ORIGINAL_CSP` allows and forbids (its doc says why), and that every
@@ -687,10 +724,9 @@ mod tests {
     /// files are MP4 inside, and Chromium refuses to play `video/quicktime`.
     #[tokio::test]
     async fn originals_are_served_with_a_type_browsers_play() {
-        let (dir, app, links, _log) = app_with_files(&["Trip/c.MOV", "Trip/d.m4v"]).await;
+        let (_dir, app, links, _log) = app_with_files(&["Trip/c.MOV", "Trip/d.m4v"]).await;
         let cookie = session_cookie(&app).await;
-        let link_ids = LinkIds::load_or_create(&dir.path().join("link.key")).unwrap();
-        let original = |path: &str| routes::original_url(&link_ids.item(path));
+        let original = |path: &str| routes::original_url(&links.ids.item(path));
         for (url, content_type) in [
             (links.photo.clone(), "image/svg+xml"),
             (links.video.clone(), "video/mp4"),
