@@ -60,6 +60,8 @@ pub struct Library {
 pub struct Snapshot {
     pub albums: Arc<Vec<Album>>,
     pub storage: StorageState,
+    /// Where each album sits in `albums`, by link id.
+    albums_by_link_id: Arc<HashMap<String, usize>>,
     /// Where each item sits in `albums`, by link id.
     items_by_link_id: Arc<HashMap<String, ItemPosition>>,
     skipped: Skipped,
@@ -210,6 +212,7 @@ impl Library {
             snapshot: RwLock::new(Arc::new(Snapshot {
                 albums: Arc::new(Vec::new()),
                 storage: StorageState::Unreadable,
+                albums_by_link_id: Arc::new(HashMap::new()),
                 items_by_link_id: Arc::new(HashMap::new()),
                 skipped: Skipped::default(),
             })),
@@ -270,6 +273,7 @@ impl Library {
                     );
                 }
                 self.replace_snapshot(Snapshot {
+                    albums_by_link_id: Arc::new(index_albums(&albums)),
                     items_by_link_id: Arc::new(index_items(&albums)),
                     albums: Arc::new(albums),
                     storage: StorageState::Available,
@@ -514,7 +518,7 @@ impl Library {
 impl Snapshot {
     /// The album with this link id.
     pub fn album(&self, id: &str) -> Option<&Album> {
-        self.albums.iter().find(|album| album.id == id)
+        self.albums.get(*self.albums_by_link_id.get(id)?)
     }
 
     /// The item with this link id and its album. Only link ids whose file is
@@ -528,6 +532,7 @@ impl Snapshot {
     fn with_storage(&self, storage: StorageState) -> Self {
         Self {
             albums: self.albums.clone(),
+            albums_by_link_id: self.albums_by_link_id.clone(),
             items_by_link_id: self.items_by_link_id.clone(),
             storage,
             skipped: self.skipped,
@@ -580,6 +585,15 @@ fn refuse_shared_album_ids(albums: Vec<Album>) -> Vec<Album> {
     albums
         .into_iter()
         .filter(|album| !shared.contains(&album.id))
+        .collect()
+}
+
+/// Each album's position by link id. Albums sharing one were already refused
+/// (see [`refuse_shared_album_ids`]).
+fn index_albums(albums: &[Album]) -> HashMap<String, usize> {
+    let positions = albums.iter().enumerate();
+    positions
+        .map(|(position, album)| (album.id.clone(), position))
         .collect()
 }
 
@@ -747,6 +761,7 @@ mod tests {
         library.scan_now().unwrap();
         let again = library.snapshot();
         assert_eq!(ids(&again), ids(&first));
+        assert_eq!(again.albums_by_link_id, first.albums_by_link_id);
         assert_eq!(again.items_by_link_id, first.items_by_link_id);
         assert_eq!(again.storage, first.storage);
     }

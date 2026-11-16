@@ -1064,6 +1064,28 @@ mod tests {
         }
     }
 
+    /// Album pages take album link ids, and nothing else: among several
+    /// albums, each opens by its own id.
+    #[tokio::test]
+    async fn album_pages_take_only_album_link_ids() {
+        let (_dir, app, links, _log) =
+            app_with_files(&["Clips/c.mp4", "Lake/d.mp4", "Zoo/e.mp4"]).await;
+        let cookie = session_cookie(&app).await;
+        for name in ["Clips", "Lake", "Trip", "Zoo"] {
+            let page = routes::album_url(&links.ids.album(name));
+            let response = send(&app, open(&page, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::OK, "{page}");
+            let html = body_text(response).await;
+            let shown = format!(r#"<p class="name">{name}</p>"#);
+            assert!(html.contains(&shown), "{html}");
+        }
+        let photo_id = links.photo.trim_start_matches("/media/");
+        for page in [routes::album_url("unknown"), routes::album_url(photo_id)] {
+            let response = send(&app, open(&page, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{page}");
+        }
+    }
+
     /// Item pages take the same link ids as items, and nothing else.
     #[tokio::test]
     async fn item_pages_take_only_item_link_ids() {
