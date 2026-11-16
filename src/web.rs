@@ -277,6 +277,8 @@ mod tests {
 
     /// Size of the test video, `b.mp4`, in bytes.
     const VIDEO_LEN: usize = 64;
+    /// The test videos' contents.
+    const VIDEO: [u8; VIDEO_LEN] = [0; VIDEO_LEN];
     const OLD_BROWSER: &str = "Mozilla/5.0 (Macintosh) AppleWebKit/605 Safari/605";
     const ALICE: [u8; 4] = [192, 168, 1, 10];
     const MALLORY: [u8; 4] = [10, 0, 0, 66];
@@ -311,37 +313,55 @@ mod tests {
     async fn app_with_files(
         items: &[&str],
     ) -> (tempfile::TempDir, Router, Links, access_log::Lines) {
+        let files: Vec<(&str, &[u8])> = [("Trip/a.svg", b"<svg/>".as_slice())]
+            .into_iter()
+            .chain(
+                std::iter::once(&"Trip/b.mp4")
+                    .chain(items)
+                    .map(|item| (*item, &VIDEO[..])),
+            )
+            .collect();
+        let (dir, router, ids, log) = app_over("{album_name}/{file_name}", &files).await;
+        let (photo_id, video_id) = (ids.item("Trip/a.svg"), ids.item("Trip/b.mp4"));
+        let links = Links {
+            album: routes::album_url(&ids.album("Trip")).to_string(),
+            photo: routes::original_url(&photo_id).to_string(),
+            video: routes::original_url(&video_id).to_string(),
+            photo_page: routes::item_page_url(&photo_id).to_string(),
+            video_page: routes::item_page_url(&video_id).to_string(),
+            ids,
+        };
+        (dir, router, links, log)
+    }
+
+    /// A router over a temporary library of `files` (item path and contents)
+    /// laid out by `pattern`; their folders are created. Also returns the
+    /// library's link ids and its access log, kept in memory.
+    async fn app_over(
+        pattern: &str,
+        files: &[(&str, &[u8])],
+    ) -> (tempfile::TempDir, Router, LinkIds, access_log::Lines) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("storage");
-        std::fs::create_dir_all(root.join("Trip")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join(".albums-root"), "").unwrap();
-        std::fs::write(root.join("Trip/a.svg"), "<svg/>").unwrap();
-        for item in std::iter::once(&"Trip/b.mp4").chain(items) {
-            let file = root.join(item);
+        for (path, contents) in files {
+            let file = root.join(path);
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            std::fs::write(file, [0u8; VIDEO_LEN]).unwrap();
+            std::fs::write(file, contents).unwrap();
         }
         let link_ids = LinkIds::load_or_create(&dir.path().join("link.key")).unwrap();
-        let (photo_id, video_id) = (link_ids.item("Trip/a.svg"), link_ids.item("Trip/b.mp4"));
-        let links = Links {
-            album: routes::album_url(&link_ids.album("Trip")),
-            photo: routes::original_url(&photo_id),
-            video: routes::original_url(&video_id),
-            photo_page: routes::item_page_url(&photo_id),
-            video_page: routes::item_page_url(&video_id),
-            ids: link_ids.clone(),
-        };
         let storage = config::Storage {
             backend: config::StorageBackend::Local,
             root: root.clone(),
-            pattern: "{album_name}/{file_name}".into(),
+            pattern: pattern.into(),
             marker: ".albums-root".into(),
             rescan_interval: Duration::from_secs(30),
             settle_time: Duration::ZERO,
             ignore: Vec::new(),
             link_key: dir.path().join("link.key"),
         };
-        let library = Library::open(&storage, link_ids).await.unwrap();
+        let library = Library::open(&storage, link_ids.clone()).await.unwrap();
         let log = Arc::new(Mutex::new(Vec::new()));
         let router = router(Arc::new(App {
             library,
@@ -353,7 +373,7 @@ mod tests {
             hsts_max_age: Duration::from_secs(60),
             access_log: access_log::AccessLog::Memory(log.clone()),
         }));
-        (dir, router, links, log)
+        (dir, router, link_ids, log)
     }
 
     async fn send(app: &Router, request: Builder) -> Response {
@@ -627,6 +647,44 @@ mod tests {
         assert!(!html.contains("<video"), "{html}");
     }
 
+    /// A tile's tooltip is the file name and the item's metadata, which its
+    /// page shows as chips; names are escaped wherever they appear.
+    #[tokio::test]
+    async fn tiles_and_item_pages_show_item_metadata() {
+        let photo = r#"Lake/001_a&b "x" <y>.jpg"#;
+        let files = [(photo, &b"x"[..]), ("Lake/002_clip.mp4", &VIDEO[..])];
+        let (_dir, app, ids, _log) = app_over("{album_name}/{seq}_{file_name}", &files).await;
+        let cookie = session_cookie(&app).await;
+        let (photo_id, video_id) = (ids.item(photo), ids.item("Lake/002_clip.mp4"));
+        let album = routes::album_url(&ids.album("Lake")).to_string();
+        let html = body_text(send(&app, open(&album, Some(&cookie))).await).await;
+        let name = "001_a&amp;b &quot;x&quot; &lt;y&gt;.jpg";
+        let tiles = [
+            format!(
+                r#"<a class="tile" href="{}" title="{name} · seq: 001"><img loading="lazy" src="{}" alt=""><span class="caption">{name}</span></a>"#,
+                routes::item_page_url(&photo_id),
+                routes::original_url(&photo_id)
+            ),
+            format!(
+                r#"<a class="tile" href="{}" title="002_clip.mp4 · seq: 002"><span class="play" aria-hidden="true">▶{}</span><span class="caption">002_clip.mp4</span></a>"#,
+                routes::item_page_url(&video_id),
+                '\u{FE0E}'
+            ),
+        ];
+        for tile in tiles {
+            assert!(html.contains(&tile), "{tile}\n{html}");
+        }
+
+        let page = routes::item_page_url(&photo_id).to_string();
+        let html = body_text(send(&app, open(&page, Some(&cookie))).await).await;
+        for shown in [
+            format!(r#"<p class="name">{name}</p>"#),
+            r#"<div class="chips"><span class="chip">seq: 001</span></div>"#.to_string(),
+        ] {
+            assert!(html.contains(&shown), "{shown}\n{html}");
+        }
+    }
+
     /// An album's cover is its first photo, loaded lazily, even after a video;
     /// an album of only videos gets an empty cover.
     #[tokio::test]
@@ -637,10 +695,10 @@ mod tests {
         let html = body_text(send(&app, open(routes::HOME, Some(&cookie))).await).await;
         let cover = |album: &str, photo: Option<&str>| {
             let img = photo.map_or(String::new(), |photo| {
-                let src = routes::original_url(&links.ids.item(photo));
+                let src = routes::original_url(&links.ids.item(photo)).to_string();
                 format!(r#"<img loading="lazy" src="{src}" alt="">"#)
             });
-            let href = routes::album_url(&links.ids.album(album));
+            let href = routes::album_url(&links.ids.album(album)).to_string();
             format!(r#"<a class="album" href="{href}"><div class="cover">{img}</div>"#)
         };
         for expected in [
@@ -704,7 +762,7 @@ mod tests {
             ),
             (
                 "unknown",
-                open(&routes::original_url("unknown"), Some(&cookie)),
+                open(&routes::original_url("unknown").to_string(), Some(&cookie)),
                 StatusCode::NOT_FOUND,
             ),
             (
@@ -732,7 +790,7 @@ mod tests {
     async fn originals_are_served_with_a_type_browsers_play() {
         let (_dir, app, links, _log) = app_with_files(&["Trip/c.MOV", "Trip/d.m4v"]).await;
         let cookie = session_cookie(&app).await;
-        let original = |path: &str| routes::original_url(&links.ids.item(path));
+        let original = |path: &str| routes::original_url(&links.ids.item(path)).to_string();
         for (url, content_type) in [
             (links.photo.clone(), "image/svg+xml"),
             (links.video.clone(), "video/mp4"),
@@ -1129,7 +1187,7 @@ mod tests {
             app_with_files(&["Clips/c.mp4", "Lake/d.mp4", "Zoo/e.mp4"]).await;
         let cookie = session_cookie(&app).await;
         for name in ["Clips", "Lake", "Trip", "Zoo"] {
-            let page = routes::album_url(&links.ids.album(name));
+            let page = routes::album_url(&links.ids.album(name)).to_string();
             let response = send(&app, open(&page, Some(&cookie))).await;
             assert_eq!(response.status(), StatusCode::OK, "{page}");
             let html = body_text(response).await;
@@ -1137,7 +1195,9 @@ mod tests {
             assert!(html.contains(&shown), "{html}");
         }
         let photo_id = links.photo.trim_start_matches("/media/");
-        for page in [routes::album_url("unknown"), routes::album_url(photo_id)] {
+        for page in
+            [routes::album_url("unknown"), routes::album_url(photo_id)].map(|page| page.to_string())
+        {
             let response = send(&app, open(&page, Some(&cookie))).await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{page}");
         }
@@ -1152,7 +1212,9 @@ mod tests {
         for page in [
             routes::item_page_url("unknown"),
             routes::item_page_url(album_id),
-        ] {
+        ]
+        .map(|page| page.to_string())
+        {
             let response = send(&app, open(&page, Some(&cookie))).await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{page}");
         }

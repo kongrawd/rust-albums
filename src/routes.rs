@@ -2,6 +2,7 @@
 //! for links, and the check that keeps post-sign-in redirects on this site.
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use std::fmt;
 
 pub const HOME: &str = "/";
 pub const SIGN_IN: &str = "/login";
@@ -25,18 +26,43 @@ const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
-/// Link ids are already URL-safe (base64url), so they need no encoding.
-pub fn album_url(album_id: &str) -> String {
-    format!("{ALBUM_PREFIX}{album_id}")
+/// The URL of an album, an item's page or an original, by link id. It is
+/// written out through `Display`, so pages render it without building a
+/// `String` per link (`to_string` gives one where needed). Link ids are already
+/// URL-safe (base64url), so they need no encoding.
+#[derive(Clone, Copy)]
+pub struct Link<'a> {
+    prefix: &'static str,
+    id: &'a str,
 }
 
-pub fn original_url(item_id: &str) -> String {
-    format!("{ORIGINAL_PREFIX}{item_id}")
+impl fmt::Display for Link<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.prefix)?;
+        f.write_str(self.id)
+    }
+}
+
+pub fn album_url(album_id: &str) -> Link<'_> {
+    Link {
+        prefix: ALBUM_PREFIX,
+        id: album_id,
+    }
+}
+
+pub fn original_url(item_id: &str) -> Link<'_> {
+    Link {
+        prefix: ORIGINAL_PREFIX,
+        id: item_id,
+    }
 }
 
 /// The page showing an item, as opposed to its original ([`original_url`]).
-pub fn item_page_url(item_id: &str) -> String {
-    format!("{ITEM_PAGE_PREFIX}{item_id}")
+pub fn item_page_url(item_id: &str) -> Link<'_> {
+    Link {
+        prefix: ITEM_PAGE_PREFIX,
+        id: item_id,
+    }
 }
 
 /// The sign-in form, set to return to `target` (a local URL) afterwards.
@@ -68,9 +94,9 @@ mod tests {
         assert!(ALBUM.starts_with(ALBUM_PREFIX));
         assert!(ORIGINAL.starts_with(ORIGINAL_PREFIX));
         assert!(ITEM_PAGE.starts_with(ITEM_PAGE_PREFIX));
-        assert_eq!(album_url("q2bMf0-_x"), "/albums/q2bMf0-_x");
-        assert_eq!(original_url("q2bMf0-_x"), "/media/q2bMf0-_x");
-        assert_eq!(item_page_url("q2bMf0-_x"), "/items/q2bMf0-_x");
+        assert_eq!(album_url("q2bMf0-_x").to_string(), "/albums/q2bMf0-_x");
+        assert_eq!(original_url("q2bMf0-_x").to_string(), "/media/q2bMf0-_x");
+        assert_eq!(item_page_url("q2bMf0-_x").to_string(), "/items/q2bMf0-_x");
         assert_eq!(
             sign_in_url("/albums/a?x=1"),
             "/login?next=%2Falbums%2Fa%3Fx%3D1"
