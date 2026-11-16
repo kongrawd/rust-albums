@@ -144,18 +144,42 @@ pub enum MediaKind {
 }
 
 impl MediaKind {
-    /// Only formats browsers can display inline count as items. A fixed list
-    /// rather than mime_guess, which also accepts formats like tiff and avi.
+    /// The kind of item `file_name` is, if any (see [`content_type`]).
     pub fn from_file_name(file_name: &str) -> Option<Self> {
-        let extension = Path::new(file_name)
-            .extension()?
-            .to_str()?
-            .to_ascii_lowercase();
-        match extension.as_str() {
-            "jpg" | "jpeg" | "png" | "gif" | "webp" | "avif" | "bmp" | "svg" => Some(Self::Image),
-            "mp4" | "webm" | "mov" | "m4v" => Some(Self::Video),
-            _ => None,
-        }
+        let content_type = content_type(file_name)?;
+        Some(if content_type.starts_with("video/") {
+            Self::Video
+        } else {
+            Self::Image
+        })
+    }
+}
+
+/// The Content-Type an item's original is served with, or `None` if the file
+/// isn't an item: only types browsers can display inline count. mime_guess
+/// maps the extension, so spellings like `.jfif` need no upkeep here; the
+/// other image and video types it knows (camera RAW, TIFF, HEIC, AVI, MKV)
+/// stay out.
+///
+/// QuickTime and M4V files are MP4 inside and are served as `video/mp4`:
+/// Chromium plays them only under that type, Firefox and Safari under either.
+/// The type comes from the item's own name, never from a file it links to.
+pub fn content_type(file_name: &str) -> Option<&'static str> {
+    let path = Path::new(file_name);
+    // Gzip-compressed SVG would be served without `Content-Encoding`, which
+    // browsers can't show.
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("svgz"))
+    {
+        return None;
+    }
+    match mime_guess::from_path(path).first_raw()? {
+        image @ ("image/jpeg" | "image/png" | "image/apng" | "image/gif" | "image/webp"
+        | "image/avif" | "image/jxl" | "image/bmp" | "image/svg+xml") => Some(image),
+        "video/mp4" | "video/x-m4v" | "video/quicktime" => Some("video/mp4"),
+        "video/webm" => Some("video/webm"),
+        _ => None,
     }
 }
 
@@ -632,6 +656,57 @@ mod tests {
         }
         let library = library(base.path(), &settings(&root, "{album_name}/{file_name}")).await;
         (base, library)
+    }
+
+    /// Files of the types browsers show are items, under any of their usual
+    /// extensions; other images and videos (camera RAW, TIFF, HEIC, AVI, SVGZ)
+    /// are not.
+    #[test]
+    fn media_types_browsers_show_are_items() {
+        for (name, kind) in [
+            ("a.jpg", MediaKind::Image),
+            ("IMG_0001.JPEG", MediaKind::Image),
+            ("a.jfif", MediaKind::Image),
+            ("a.jpe", MediaKind::Image),
+            ("a.png", MediaKind::Image),
+            ("a.apng", MediaKind::Image),
+            ("a.gif", MediaKind::Image),
+            ("a.webp", MediaKind::Image),
+            ("a.avif", MediaKind::Image),
+            ("a.bmp", MediaKind::Image),
+            ("a.svg", MediaKind::Image),
+            ("a.jxl", MediaKind::Image),
+            ("a.mp4", MediaKind::Video),
+            ("a.m4v", MediaKind::Video),
+            ("IMG_0002.MOV", MediaKind::Video),
+            ("a.qt", MediaKind::Video),
+            ("a.webm", MediaKind::Video),
+            ("2024.07.01 lake.mp4", MediaKind::Video),
+        ] {
+            assert!(MediaKind::from_file_name(name) == Some(kind), "{name}");
+            // Parsed for every request of an original, so it must never fail.
+            let served = content_type(name).unwrap();
+            assert!(served.parse::<mime_guess::Mime>().is_ok(), "{name}");
+        }
+        for name in [
+            "a.dng",
+            "a.CR2",
+            "a.nef",
+            "a.arw",
+            "a.tif",
+            "a.tiff",
+            "a.heic",
+            "a.avi",
+            "a.mkv",
+            "a.ts",
+            "a.svgz", // gzip-compressed SVG, served without saying so
+            "notes.txt",
+            "README",
+            ".jpg",
+            "a.jpg.part",
+        ] {
+            assert!(MediaKind::from_file_name(name).is_none(), "{name}");
+        }
     }
 
     #[tokio::test]

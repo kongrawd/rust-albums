@@ -30,6 +30,8 @@ subtle = "2"
 walkdir = "2"
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
 percent-encoding = "2"
+# File name -> media type (already in the tree via tower-http).
+mime_guess = { version = "2", default-features = false }
 unicode-normalization = "0.1"
 serde = { version = "1", features = ["derive"] }
 toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }

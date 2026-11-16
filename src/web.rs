@@ -2,7 +2,7 @@
 //! headers on every response.
 
 use crate::auth::{self, Verdict};
-use crate::{AppState, access_log, html, routes, session};
+use crate::{AppState, access_log, html, library, routes, session};
 use axum::{
     Extension, Form, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
@@ -12,6 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use maud::Markup;
+use mime_guess::Mime;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -238,12 +239,17 @@ async fn serve_original(
         .library
         .item_path(&item_id)
         .ok_or(StatusCode::NOT_FOUND)?;
+    let content_type = library::content_type(&item_path).ok_or(StatusCode::NOT_FOUND)?;
+    let content_type: Mime = content_type.parse().expect("a valid media type");
     let open = async {
         let file = state.library.item_file(&item_path).await;
         let file = file.ok_or(StatusCode::NOT_FOUND)?;
-        // ServeFile handles Content-Type, Range (video seeking) and conditional
-        // requests. No sendfile: rustls encrypts in user space, so zero-copy can't apply.
-        let Ok(response) = ServeFile::new(file).oneshot(request).await;
+        // ServeFile handles Range (video seeking) and conditional requests; the
+        // Content-Type is the item's own. No sendfile: rustls encrypts in user
+        // space, so zero-copy can't apply.
+        let Ok(response) = ServeFile::new_with_mime(file, &content_type)
+            .oneshot(request)
+            .await;
         Ok(response)
     };
     // A hung mount must not hang the request too: finding the file, opening it
@@ -289,12 +295,22 @@ mod tests {
 
     /// [`app`], with its access log kept in memory.
     async fn app_with_log() -> (tempfile::TempDir, Router, Links, access_log::Lines) {
+        app_with_files(&[]).await
+    }
+
+    /// [`app_with_log`], with more videos (`VIDEO_LEN` zero bytes each) at
+    /// these item paths.
+    async fn app_with_files(
+        videos: &[&str],
+    ) -> (tempfile::TempDir, Router, Links, access_log::Lines) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("storage");
         std::fs::create_dir_all(root.join("Trip")).unwrap();
         std::fs::write(root.join(".albums-root"), "").unwrap();
         std::fs::write(root.join("Trip/a.svg"), "<svg/>").unwrap();
-        std::fs::write(root.join("Trip/b.mp4"), [0u8; VIDEO_LEN]).unwrap();
+        for video in std::iter::once(&"Trip/b.mp4").chain(videos) {
+            std::fs::write(root.join(video), [0u8; VIDEO_LEN]).unwrap();
+        }
         let link_ids = LinkIds::load_or_create(&dir.path().join("link.key")).unwrap();
         let (photo_id, video_id) = (link_ids.item("Trip/a.svg"), link_ids.item("Trip/b.mp4"));
         let links = Links {
@@ -664,6 +680,30 @@ mod tests {
             assert_eq!(response.status(), status, "{case}");
             let csp = header_of(&response, header::CONTENT_SECURITY_POLICY);
             assert_eq!(csp, ORIGINAL_CSP, "{case}");
+        }
+    }
+
+    /// Originals are served with a type every browser plays: QuickTime and M4V
+    /// files are MP4 inside, and Chromium refuses to play `video/quicktime`.
+    #[tokio::test]
+    async fn originals_are_served_with_a_type_browsers_play() {
+        let (dir, app, links, _log) = app_with_files(&["Trip/c.MOV", "Trip/d.m4v"]).await;
+        let cookie = session_cookie(&app).await;
+        let link_ids = LinkIds::load_or_create(&dir.path().join("link.key")).unwrap();
+        let original = |path: &str| routes::original_url(&link_ids.item(path));
+        for (url, content_type) in [
+            (links.photo.clone(), "image/svg+xml"),
+            (links.video.clone(), "video/mp4"),
+            (original("Trip/c.MOV"), "video/mp4"),
+            (original("Trip/d.m4v"), "video/mp4"),
+        ] {
+            let response = send(&app, open(&url, Some(&cookie))).await;
+            assert_eq!(response.status(), StatusCode::OK, "{url}");
+            assert_eq!(
+                header_of(&response, header::CONTENT_TYPE),
+                content_type,
+                "{url}"
+            );
         }
     }
 

@@ -859,6 +859,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "maud",
+ "mime_guess",
  "percent-encoding",
  "rcgen",
  "regex",

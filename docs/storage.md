@@ -17,7 +17,7 @@ The pattern describes the folders below the root. Each `/`-separated **segment**
 | `{year}/{album_name}/{file_name}` | `2024/Lake/a.jpg` | year, album_name |
 | `year={year}/{date}_{album_name}/{seq}_{file_name}` | `year=2024/2024-07-01_Lake/001_dock.jpg` | year, date, album_name; item: seq, file_name |
 
-Supported formats: jpg, jpeg, png, gif, webp, avif, bmp and svg images; mp4, webm, mov and m4v videos. Videos are served as they are, so the browser must support their codec (see [troubleshooting](troubleshooting.md#while-running)).
+Supported formats: JPEG, PNG, GIF, WebP, AVIF, JPEG XL, BMP and SVG images; MP4, MOV and WebM videos. Videos are served as they are, so the browser must support their codec (see [troubleshooting](troubleshooting.md#while-running)).
 
 ## The marker file
 
