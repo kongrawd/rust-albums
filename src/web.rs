@@ -390,7 +390,19 @@ mod tests {
         thumbnails: bool,
     ) -> (tempfile::TempDir, Router, LinkIds, access_log::Lines) {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("storage");
+        let storage = storage_with(dir.path(), pattern, files);
+        let (state, link_ids, log) = state_over(&storage, dir.path(), thumbnails).await;
+        (dir, router(state), link_ids, log)
+    }
+
+    /// Storage settings over `<dir>/storage`, a root holding `files` and the
+    /// marker, laid out by `pattern`, with its link key in `dir`.
+    fn storage_with(
+        dir: &std::path::Path,
+        pattern: &str,
+        files: &[(&str, &[u8])],
+    ) -> config::Storage {
+        let root = dir.join("storage");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join(".albums-root"), "").unwrap();
         for (path, contents) in files {
@@ -398,26 +410,37 @@ mod tests {
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(file, contents).unwrap();
         }
-        let link_ids = LinkIds::load_or_create(&dir.path().join("link.key")).unwrap();
-        let storage = config::Storage {
+        config::Storage {
             backend: config::StorageBackend::Local,
-            root: root.clone(),
+            root,
             pattern: pattern.into(),
             marker: ".albums-root".into(),
             rescan_interval: Duration::from_secs(30),
             settle_time: Duration::ZERO,
             ignore: Vec::new(),
-            link_key: dir.path().join("link.key"),
-        };
-        let library = Library::open(&storage, link_ids.clone()).await.unwrap();
+            link_key: dir.join("link.key"),
+        }
+    }
+
+    /// The app over `storage` after its first scan, as a start builds it,
+    /// with or without thumbnails, kept in `<dir>/thumbnails`.
+    async fn state_over(
+        storage: &config::Storage,
+        dir: &std::path::Path,
+        thumbnails: bool,
+    ) -> (crate::AppState, LinkIds, access_log::Lines) {
+        let link_ids = LinkIds::load_or_create(&storage.link_key).unwrap();
+        let library = Library::open(storage, link_ids.clone()).await.unwrap();
         let log = Arc::new(Mutex::new(Vec::new()));
         // Made by a child that writes back the video: tests choose it.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let thumbnails = thumbnails.then(|| {
             let child = crate::thumbnail::testing::fake("echo");
-            crate::thumbnail::testing::service(child, Duration::from_secs(5), "test", dir.path()).0
+            crate::thumbnail::testing::service(child, Duration::from_secs(5), "test", dir).0
         });
-        let router = router(Arc::new(App {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = (thumbnails, dir);
+        let state = Arc::new(App {
             library,
             credentials: Credentials::new("alice", "pw").unwrap(),
             sessions: Arc::new(session::Sessions::new(&config::Session {
@@ -428,8 +451,8 @@ mod tests {
             access_log: access_log::AccessLog::Memory(log.clone()),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             thumbnails,
-        }));
-        (dir, router, link_ids, log)
+        });
+        (state, link_ids, log)
     }
 
     async fn send(app: &Router, request: Builder) -> Response {
@@ -867,6 +890,119 @@ mod tests {
                 content_type,
                 "{url}"
             );
+        }
+    }
+
+    /// The videos of the storage-change tests, by path.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const VIDEOS: [&str; 3] = ["Trip/a.mp4", "Trip/b.mp4", "Home/c.mp4"];
+
+    /// Starts over `storage` with the [`VIDEOS`] in its root, makes each one's
+    /// thumbnail, then changes the files or settings with `change` and starts
+    /// again, sweeping as the first scan of a start does. Gives the link ids
+    /// before the change and the item folders left in the cache.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn restarted_after(
+        change: impl FnOnce(&mut config::Storage, &std::path::Path),
+    ) -> (tempfile::TempDir, crate::AppState, LinkIds, Vec<String>) {
+        use crate::thumbnail::testing::{JPEG, cache, open};
+        let dir = tempfile::tempdir().unwrap();
+        let files = VIDEOS.map(|path| (path, JPEG));
+        let mut storage = storage_with(dir.path(), "{album_name}/{file_name}", &files);
+        let (before, ids, _) = state_over(&storage, dir.path(), true).await;
+        let thumbnails = before.thumbnails.as_ref().unwrap();
+        for path in VIDEOS {
+            let original = open(&storage.root.join(path));
+            assert!(
+                thumbnails
+                    .thumbnail(&ids.item(path), original)
+                    .await
+                    .is_some()
+            );
+        }
+        change(&mut storage, dir.path());
+        let (after, _, _) = state_over(&storage, dir.path(), true).await;
+        crate::keep_thumbnails_of(after.clone(), after.library.snapshot()).await;
+        let mut left: Vec<_> = std::fs::read_dir(cache(dir.path()))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        (dir, after, ids, left)
+    }
+
+    /// Thumbnails follow the library through changes to its files and
+    /// settings: items whose path is the same keep theirs (a root moved, a
+    /// pattern edited); items no longer there, or there under another path
+    /// (moved, renamed, now ignored, or laid out at another depth), lose
+    /// theirs after the first scan.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn thumbnails_follow_changes_to_the_storage() {
+        type Change = fn(&mut config::Storage, &std::path::Path);
+        let cases: [(&str, Change, &[&str]); 6] = [
+            ("nothing changed", |_, _| {}, &VIDEOS),
+            (
+                "the root moved",
+                |storage, dir| {
+                    std::fs::rename(&storage.root, dir.join("moved")).unwrap();
+                    storage.root = dir.join("moved");
+                },
+                &VIDEOS,
+            ),
+            (
+                "the pattern edited, the same paths",
+                |storage, _| storage.pattern = "{album_name}/{title}.mp4".into(),
+                &VIDEOS,
+            ),
+            (
+                "the pattern of another depth",
+                |storage, _| storage.pattern = "{year}/{album_name}/{file_name}".into(),
+                &[],
+            ),
+            (
+                "an album ignored",
+                |storage, _| storage.ignore = vec!["Home".into()],
+                &["Trip/a.mp4", "Trip/b.mp4"],
+            ),
+            (
+                "videos moved and renamed",
+                |storage, _| {
+                    let root = &storage.root;
+                    std::fs::rename(root.join("Trip/a.mp4"), root.join("Trip/d.mp4")).unwrap();
+                    std::fs::rename(root.join("Trip/b.mp4"), root.join("Home/b.mp4")).unwrap();
+                },
+                &["Home/c.mp4"],
+            ),
+        ];
+        for (case, change, kept) in cases {
+            let (_dir, _, ids, left) = restarted_after(change).await;
+            let mut expected: Vec<_> = kept.iter().map(|path| ids.item(path)).collect();
+            expected.sort();
+            assert_eq!(left, expected, "{case}");
+        }
+    }
+
+    /// A new link key gives every item a new link id: the thumbnails kept
+    /// under the old ids are removed after the first scan, and each item's
+    /// is made again under its new id, never taken from an old folder.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_new_link_key_makes_thumbnails_anew() {
+        use crate::thumbnail::testing::{cache, open};
+        let (dir, after, _, left) =
+            restarted_after(|storage, dir| storage.link_key = dir.join("new.key")).await;
+        assert_eq!(left, [] as [String; 0]);
+        let new_ids = LinkIds::load_or_create(&dir.path().join("new.key")).unwrap();
+        let thumbnails = after.thumbnails.as_ref().unwrap();
+        let root = after.library.snapshot();
+        assert_eq!(root.item_ids().count(), VIDEOS.len());
+        for path in VIDEOS {
+            let id = new_ids.item(path);
+            assert!(root.item(&id).is_some(), "{path}");
+            let original = open(&dir.path().join("storage").join(path));
+            let made = thumbnails.thumbnail(&id, original).await.unwrap();
+            assert!(made.starts_with(cache(dir.path()).join(&id)), "{made:?}");
         }
     }
 

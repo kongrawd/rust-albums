@@ -1,9 +1,22 @@
 //! The thumbnail service: each original's thumbnail is made once, in a child
 //! (see `child`), and kept in a folder; what failed is remembered, so it isn't
 //! tried again on every page view.
+//!
+//! The folder holds one folder per item, named by its link id, holding
+//! `<version>.jpg` or `<version>.none-<build>`; making either removes the
+//! item's older versions. After each scan the library hands over, only its
+//! items keep their folders ([`Thumbnails::keep_only`]). Only names this
+//! module gives are ever removed: item folders, the `<version>.jpg` and
+//! `<version>.none-<build>` names in them and their temporary files, and the
+//! same names as `<item id>-<version>.…`, kept before items had folders. The folder belongs to one library: another one sharing it, with
+//! other items or another link key, would remove these thumbnails. It must
+//! be apart from the library ([`Thumbnails::apart_from`]), and an item folder
+//! that is a link is never written through, so the library never loses a
+//! file to the cache.
 
 use super::child::{Failure, Original, Thumbnailer};
 use crate::crypto::TEMPORARY_INFIX;
+use crate::link_ids::{ID_LEN, is_link_id};
 use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, Metadata};
@@ -25,6 +38,9 @@ const NONE_EXTENSION: &str = "none";
 /// A temporary file this old was left behind by an interrupted write: one in
 /// progress takes seconds.
 const LEFT_BEHIND: Duration = Duration::from_secs(60 * 60);
+/// A sweep taking longer than this is said in the log (a hung mount), and
+/// still waited for.
+const SLOW_SWEEP: Duration = Duration::from_secs(60);
 /// The setting that lets children decode unsandboxed, as the log names it.
 pub const OPT_IN: &str = "allow_unconfined in [thumbnails]";
 
@@ -69,6 +85,12 @@ pub struct Thumbnails {
 }
 
 impl Thumbnails {
+    /// This service, if its folder is apart from the library at `root`
+    /// (canonical): else why not.
+    pub fn apart_from(self, root: &Path) -> Result<Self, String> {
+        apart(&self.dir, root).map(|()| self)
+    }
+
     pub fn new(dir: PathBuf, thumbnailer: Thumbnailer, build: String, log: AuditLog) -> Self {
         Self {
             dir,
@@ -124,6 +146,10 @@ impl Thumbnails {
         match made_by_child {
             Ok(jpeg) => {
                 let len = jpeg.len();
+                // If the item leaves the library meanwhile, the sweep may
+                // remove this write's temporary file ("made but not kept"),
+                // or the write may make its folder again, which the next
+                // sweep or start removes.
                 match write(made.clone(), jpeg).await {
                     Ok(()) => {
                         outcome(&format_args!("made, {len} bytes"));
@@ -169,6 +195,49 @@ impl Thumbnails {
         }
     }
 
+    /// Removes the thumbnails of items not in `items`, the item ids of a
+    /// scan the library handed over, and those kept before items had folders
+    /// of their own, saying how many if any, and that some can't be. Only
+    /// gone items are touched, so a request in flight is affected only for
+    /// one of them: it may find the thumbnail it was about to give gone (a
+    /// 404), or write the folder again (see [`Self::thumbnail`]).
+    pub async fn keep_only(&self, items: HashSet<String>) {
+        let dir = self.dir.clone();
+        let sweep = blocking(move || Ok(remove_gone(&dir, &items)));
+        // A real sweep can't be made slow: its time limit is tested with a
+        // stand-in.
+        let swept = self.waited_for_sweep(sweep).await;
+        // Not tested: only a panic in the sweep gets here.
+        let Removed { count, error } = swept.unwrap_or_else(|err| Removed {
+            error: Some(err),
+            ..Removed::default()
+        });
+        if count > 0 {
+            self.log
+                .write(format!("thumbnails: removed {count} no longer needed"));
+        }
+        if let Some(err) = error {
+            self.log.write(format!(
+                "thumbnails: some no longer needed not removed: {err}"
+            ));
+        }
+    }
+
+    /// Waits for the sweep `work`, saying in the log if it takes over
+    /// [`SLOW_SWEEP`].
+    async fn waited_for_sweep<T>(&self, work: impl Future<Output = T>) -> T {
+        let mut work = std::pin::pin!(work);
+        match tokio::time::timeout(SLOW_SWEEP, &mut work).await {
+            Ok(done) => done,
+            Err(_) => {
+                self.log.write(format!(
+                    "thumbnails: removing those no longer needed is taking over {SLOW_SWEEP:?}, and scans wait: is the thumbnails folder's mount hung?"
+                ));
+                work.await
+            }
+        }
+    }
+
     fn failed_this_run(&self) -> MutexGuard<'_, HashSet<(String, Version)>> {
         self.failed_this_run
             .lock()
@@ -187,37 +256,105 @@ impl Thumbnails {
 /// `current`, whichever build wrote them, and temporary files [`LEFT_BEHIND`].
 /// Everything else stays: the current version; a newer one, which a request
 /// that opened the original before an edit mustn't remove; a write in
-/// progress; and names not ours. Blocking. What can't be removed doesn't stop
-/// the rest; the first error is returned.
+/// progress; and names not ours. Blocking; the first error is returned.
 fn remove_older_from(folder: &Path, current: Version) -> io::Result<()> {
     let left_behind = SystemTime::now() - LEFT_BEHIND;
-    let mut first_error = None;
-    for entry in fs::read_dir(folder)? {
-        let removed = entry.and_then(|entry| {
-            let name = entry.file_name();
-            let older = match name.to_str().and_then(Version::named) {
-                None => false,
-                Some(_) if name.to_string_lossy().contains(TEMPORARY_INFIX) => {
-                    entry.metadata()?.modified()? < left_behind
-                }
-                Some(version) => version.changed < current.changed,
-            };
-            if older {
-                fs::remove_file(entry.path())?;
+    let removed = remove_each(folder, |entry, name| {
+        let older = match Version::named(name) {
+            None => false,
+            Some(_) if name.contains(TEMPORARY_INFIX) => {
+                entry.metadata()?.modified()? < left_behind
             }
-            Ok(())
+            Some(version) => version.changed < current.changed,
+        };
+        if older {
+            fs::remove_file(entry.path())?;
+        }
+        Ok(older)
+    });
+    removed.error.map_or(Ok(()), Err)
+}
+
+/// Removes from the cache `dir` the folders of items not in `items`, and
+/// the files kept before items had folders; anything else stays, as does a
+/// gone item's folder holding something not ours. Blocking.
+fn remove_gone(dir: &Path, items: &HashSet<String>) -> Removed {
+    remove_each(dir, |entry, name| {
+        if is_link_id(name) {
+            // A link named as an item is not ours to follow.
+            if items.contains(name) || !entry.file_type()?.is_dir() {
+                return Ok(false);
+            }
+            let folder = entry.path();
+            let emptied = remove_each(&folder, |entry, name| {
+                let ours = Version::named(name).is_some();
+                if ours {
+                    fs::remove_file(entry.path())?;
+                }
+                Ok(ours)
+            });
+            emptied.error.map_or(Ok(()), Err)?;
+            match fs::remove_dir(&folder) {
+                Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(false),
+                removed => removed.map(|()| true),
+            }
+        } else if kept_before_folders(name) {
+            fs::remove_file(entry.path()).map(|()| true)
+        } else {
+            Ok(false)
+        }
+    })
+}
+
+/// What a removal did: how many it removed, and its first error.
+#[derive(Default)]
+struct Removed {
+    count: usize,
+    error: Option<io::Error>,
+}
+
+/// Calls `remove` with each entry of `folder` and its name, counting those
+/// it removed. Names that aren't UTF-8 aren't ours, and a folder that isn't
+/// there holds nothing. What can't be removed doesn't stop the rest; the
+/// first error is kept.
+fn remove_each(
+    folder: &Path,
+    mut remove: impl FnMut(&fs::DirEntry, &str) -> io::Result<bool>,
+) -> Removed {
+    let mut removed = Removed::default();
+    let entries = match fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return removed,
+        Err(err) => {
+            removed.error = Some(err);
+            return removed;
+        }
+    };
+    for entry in entries {
+        let outcome = entry.and_then(|entry| {
+            let name = entry.file_name();
+            name.to_str().map_or(Ok(false), |name| remove(&entry, name))
         });
-        match removed {
-            // Gone already, removed or renamed into place by another request.
-            // Not tested: it needs two requests to race.
+        match outcome {
+            Ok(true) => removed.count += 1,
+            Ok(false) => {}
+            // Gone already: removed by a request or the sweep, or renamed into
+            // place by a request. Not tested: it needs them to race.
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => {
-                first_error.get_or_insert(err);
+                removed.error.get_or_insert(err);
             }
-            Ok(()) => {}
         }
     }
-    first_error.map_or(Ok(()), Err)
+    removed
+}
+
+/// Whether `name` was kept before items had folders of their own:
+/// `<item id>-` and a name [`Version::named`] takes.
+fn kept_before_folders(name: &str) -> bool {
+    name.split_at_checked(ID_LEN).is_some_and(|(id, version)| {
+        is_link_id(id) && version.strip_prefix('-').and_then(Version::named).is_some()
+    })
 }
 
 /// Whether `path` exists; an error reading the folder counts as no.
@@ -225,9 +362,55 @@ async fn exists(path: &Path) -> bool {
     tokio::fs::try_exists(path).await.unwrap_or(false)
 }
 
-/// Writes `bytes` to `path` atomically, on a blocking thread.
+/// Writes `bytes` to `path` atomically, on a blocking thread, in an item
+/// folder of its own.
 async fn write(path: PathBuf, bytes: Vec<u8>) -> io::Result<()> {
-    blocking(move || crate::crypto::write_file_atomically(&path, &bytes)).await
+    blocking(move || {
+        own_folder(path.parent().expect("a file in its item's folder"))?;
+        crate::crypto::write_file_atomically(&path, &bytes)
+    })
+    .await
+}
+
+/// Fails if `folder` is there but not a folder of its own: a link, which
+/// could lead into the library, is never written through.
+fn own_folder(folder: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(folder) {
+        Ok(metadata) if !metadata.is_dir() => Err(io::Error::other(
+            "the item's folder is a link or a file, not a folder of its own",
+        )),
+        // Not there yet; any other error, the write itself meets.
+        _ => Ok(()),
+    }
+}
+
+/// Whether the thumbnails folder `dir` is apart from the library at `root`
+/// (canonical), where they lead: neither holds the other. Thumbnails are
+/// only ever removed in `dir`, so the library then never loses a file.
+fn apart(dir: &Path, root: &Path) -> Result<(), String> {
+    let at = leads_to(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    if at.starts_with(root) || root.starts_with(&at) {
+        return Err(format!("{} and the library overlap", dir.display()));
+    }
+    Ok(())
+}
+
+/// Where `path` leads: its longest part that exists, with links resolved,
+/// then the rest as written. Creates nothing; a `..` past what exists is an
+/// error.
+fn leads_to(path: &Path) -> io::Result<PathBuf> {
+    let path = std::path::absolute(path)?;
+    let (mut existing, mut missing) = (path.as_path(), Vec::new());
+    loop {
+        match fs::canonicalize(existing) {
+            Ok(found) => return Ok(missing.iter().rev().fold(found, |at, part| at.join(part))),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                missing.push(existing.file_name().ok_or(err)?);
+                existing = existing.parent().expect("a name has a parent");
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 /// Runs file work on a blocking thread.
@@ -267,9 +450,17 @@ impl Version {
     }
 
     /// The version file `name` is kept for, if it is one this module names:
-    /// `<size>-<time>.<anything>`.
+    /// `<version>.jpg` or `<version>.none-<build>`, or a temporary file of
+    /// either.
     fn named(name: &str) -> Option<Self> {
-        let (version, _) = name.split_once('.')?;
+        let (version, kind) = name.split_once('.')?;
+        let kind = kind
+            .split_once(TEMPORARY_INFIX)
+            .map_or(kind, |(kind, _)| kind);
+        let marker = kind.strip_prefix(NONE_EXTENSION);
+        if kind != THUMBNAIL_EXTENSION && !marker.is_some_and(|build| build.starts_with('-')) {
+            return None;
+        }
         let (len, changed) = version.split_once('-')?;
         Some(Self {
             len: len.parse().ok()?,
@@ -498,8 +689,14 @@ mod tests {
         let old_build = folder.join("1-2.none-build-0");
         let recent_write = folder.join("3-4.jpg.tmp-0123456789abcdef");
         let left_behind = folder.join("5-6.jpg.tmp-fedcba9876543210");
-        let not_ours = ["notes.txt", "notes.jpg", "notes.jpg.tmp-fedcba9876543210"]
-            .map(|name| folder.join(name));
+        let not_ours = [
+            "notes.txt",
+            "notes.jpg",
+            "notes.jpg.tmp-fedcba9876543210",
+            "1-2.png",
+            "1-2.nonesuch",
+        ]
+        .map(|name| folder.join(name));
         for file in [&old_build, &recent_write, &left_behind]
             .into_iter()
             .chain(&not_ours)
@@ -508,7 +705,9 @@ mod tests {
         }
         let two_hours_ago = SystemTime::now() - Duration::from_secs(7200);
         set_changed(&left_behind, two_hours_ago);
-        set_changed(&not_ours[2], two_hours_ago);
+        for file in &not_ours {
+            set_changed(file, two_hours_ago);
+        }
 
         fs::write(&video, b"\xFF\xD8\xFF\xE0 an edited thumbnail \xFF\xD9").unwrap();
         set_changed(&video, then + Duration::from_secs(1));
@@ -682,6 +881,292 @@ mod tests {
         thumbnails.thumbnail("item", open(&video)).await.unwrap();
         assert!(fs::symlink_metadata(&link).is_err(), "the link stays");
         assert_eq!(fs::read(&target).unwrap(), b"a photo");
+    }
+
+    /// Item ids, shaped as the library's are.
+    const KEPT: &str = "kept-kept-kept-kept-kp";
+    const GONE: &str = "gone_gone_gone_gone_gn";
+
+    /// The names `dir` holds, sorted.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// After a scan, the thumbnails of items no longer in the library are
+    /// removed, folder and all, and the log says how many; those of items
+    /// still there stay. A second sweep finds nothing and says nothing.
+    #[tokio::test]
+    async fn removes_the_thumbnails_of_items_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = original(dir.path(), JPEG);
+        let (thumbnails, log) = thumbnails("echo", dir.path());
+        let kept = thumbnails.thumbnail(KEPT, open(&video)).await.unwrap();
+        thumbnails.thumbnail(GONE, open(&video)).await.unwrap();
+        log.lock().unwrap().clear();
+        let items = HashSet::from([KEPT.to_owned()]);
+        thumbnails.keep_only(items.clone()).await;
+        assert_eq!(names(&cache(dir.path())), [KEPT]);
+        assert!(kept.exists());
+        thumbnails.keep_only(items).await;
+        let lines = log.lock().unwrap().clone();
+        assert_eq!(lines, ["thumbnails: removed 1 no longer needed"]);
+    }
+
+    /// The sweep removes only what is ours: the files kept before items had
+    /// folders (`<item id>-<version>.jpg` and the like), whichever item, and
+    /// the folders of items gone. Other names and kinds stay, as do a link
+    /// named as an item and what it points to, and what isn't ours in a gone
+    /// item's folder.
+    #[tokio::test]
+    async fn the_sweep_removes_only_what_is_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path());
+        let gone = cache.join(GONE);
+        fs::create_dir_all(&gone).unwrap();
+        for name in ["1-2.jpg", "1-2.png", "notes.txt"] {
+            fs::write(gone.join(name), b"").unwrap();
+        }
+        for name in [
+            format!("{KEPT}-19-123.jpg"),
+            format!("{GONE}-19-123.none-build-0"),
+            format!("{KEPT}-19-123.jpg.tmp-0123456789abcdef"),
+            "notes.txt".into(),
+            format!("{GONE}.txt"),
+            "kept-kept-kept-kept-k-19-123.jpg".into(),
+            "kept kept kept kept kp-19-123.jpg".into(),
+            format!("{KEPT}-19-123.png"),
+        ] {
+            fs::write(cache.join(name), b"").unwrap();
+        }
+        fs::create_dir(cache.join("backups")).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::write(elsewhere.join("1-2.jpg"), b"").unwrap();
+        let link = "link_link_link_link_lk";
+        std::os::unix::fs::symlink(&elsewhere, cache.join(link)).unwrap();
+        let (thumbnails, log) = thumbnails("echo", dir.path());
+        thumbnails.keep_only(HashSet::from([KEPT.to_owned()])).await;
+        assert_eq!(
+            names(&cache),
+            [
+                "backups",
+                GONE,
+                &format!("{GONE}.txt"),
+                "kept kept kept kept kp-19-123.jpg",
+                "kept-kept-kept-kept-k-19-123.jpg",
+                &format!("{KEPT}-19-123.png"),
+                link,
+                "notes.txt",
+            ]
+        );
+        assert_eq!(names(&gone), ["1-2.png", "notes.txt"]);
+        assert_eq!(names(&elsewhere), ["1-2.jpg"]);
+        let lines = log.lock().unwrap().clone();
+        assert_eq!(lines, ["thumbnails: removed 3 no longer needed"]);
+    }
+
+    /// A cache from before items had folders: its thumbnail of the very
+    /// same version isn't given, a new one is made in the item's folder, and
+    /// the first sweep removes the old file.
+    #[tokio::test]
+    async fn an_old_cache_layout_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = original(dir.path(), JPEG);
+        let version = Version::of(&fs::metadata(&video).unwrap());
+        let cache = cache(dir.path());
+        fs::create_dir_all(&cache).unwrap();
+        let old = cache.join(format!("{KEPT}-{version}.jpg"));
+        fs::write(&old, b"the old layout's").unwrap();
+        let (thumbnails, log) = thumbnails("echo", dir.path());
+        let made = thumbnails.thumbnail(KEPT, open(&video)).await.unwrap();
+        assert_eq!(made.parent(), Some(cache.join(KEPT).as_path()));
+        assert_eq!(fs::read(&made).unwrap(), JPEG);
+        thumbnails.keep_only(HashSet::from([KEPT.to_owned()])).await;
+        assert_eq!(names(&cache), [KEPT]);
+        let lines = log.lock().unwrap().clone();
+        assert!(
+            lines[0].starts_with(&format!("thumbnail {KEPT}: made, ")),
+            "{lines:?}"
+        );
+        assert_eq!(lines[1..], ["thumbnails: removed 1 no longer needed"]);
+    }
+
+    /// With no thumbnail kept yet there is no folder, and nothing to say.
+    #[tokio::test]
+    async fn a_sweep_before_any_thumbnail_says_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (thumbnails, log) = thumbnails("echo", dir.path());
+        thumbnails.keep_only(HashSet::new()).await;
+        assert!(log.lock().unwrap().is_empty());
+        assert!(!cache(dir.path()).exists());
+    }
+
+    /// What the sweep can't remove is said in the log, and doesn't stop the
+    /// rest. A folder named as a thumbnail can't be removed as a file.
+    #[tokio::test]
+    async fn says_when_the_sweep_cannot_remove_something() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path());
+        let stuck = cache.join("stuck_stuck_stuck_stck");
+        fs::create_dir_all(stuck.join("1-2.jpg")).unwrap();
+        for id in [GONE, "aaaaaaaaaaaaaaaaaaaaaa", "zzzzzzzzzzzzzzzzzzzzzz"] {
+            fs::create_dir_all(cache.join(id)).unwrap();
+            fs::write(cache.join(id).join("1-2.jpg"), b"").unwrap();
+        }
+        let (thumbnails, log) = thumbnails("echo", dir.path());
+        thumbnails.keep_only(HashSet::new()).await;
+        assert_eq!(names(&cache), ["stuck_stuck_stuck_stck"]);
+        let lines = log.lock().unwrap().clone();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0], "thumbnails: removed 3 no longer needed");
+        assert!(
+            lines[1].starts_with("thumbnails: some no longer needed not removed: "),
+            "{lines:?}"
+        );
+    }
+
+    /// A gone item's folder the sweep can't read stays, and the log says so.
+    #[tokio::test]
+    async fn says_when_the_sweep_cannot_read_a_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let gone = cache(dir.path()).join(GONE);
+        fs::create_dir_all(&gone).unwrap();
+        fs::write(gone.join("1-2.jpg"), b"").unwrap();
+        fs::set_permissions(&gone, fs::Permissions::from_mode(0o000)).unwrap();
+        let (thumbnails, log) = thumbnails("echo", dir.path());
+        thumbnails.keep_only(HashSet::new()).await;
+        fs::set_permissions(&gone, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(names(&gone), ["1-2.jpg"]);
+        let lines = log.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("thumbnails: some no longer needed not removed: "),
+            "{lines:?}"
+        );
+    }
+
+    /// A sweep that takes long, as on a hung mount, is said in the log, and
+    /// still waited for; one that doesn't says nothing.
+    #[tokio::test(start_paused = true)]
+    async fn says_when_a_sweep_takes_long() {
+        let dir = tempfile::tempdir().unwrap();
+        let (thumbnails, log) = thumbnails("echo", dir.path());
+        let taking = |time| async move {
+            tokio::time::sleep(time).await;
+            time
+        };
+        let quick = SLOW_SWEEP - Duration::from_secs(1);
+        assert_eq!(thumbnails.waited_for_sweep(taking(quick)).await, quick);
+        assert!(log.lock().unwrap().is_empty());
+        let slow = SLOW_SWEEP * 2;
+        assert_eq!(thumbnails.waited_for_sweep(taking(slow)).await, slow);
+        let lines = log.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            [
+                "thumbnails: removing those no longer needed is taking over 60s, and scans wait: is the thumbnails folder's mount hung?"
+            ]
+        );
+    }
+
+    /// Names that aren't UTF-8 aren't ours, even when they start as a
+    /// version does: they stay, and so does the folder holding them.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn names_not_in_utf8_are_not_ours() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let gone = cache(dir.path()).join(GONE);
+        fs::create_dir_all(&gone).unwrap();
+        let odd = gone.join(std::ffi::OsStr::from_bytes(b"1-2.\xff"));
+        for file in [&gone.join("1-2.jpg"), &odd] {
+            fs::write(file, b"").unwrap();
+        }
+        let (thumbnails, _) = thumbnails("echo", dir.path());
+        thumbnails.keep_only(HashSet::new()).await;
+        let held: Vec<_> = fs::read_dir(&gone)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(held, [odd]);
+    }
+
+    /// The thumbnails folder must be apart from the library, neither holding
+    /// the other, also through a link or before it exists, so the library
+    /// never loses a file to the cache. Nothing is created to find out.
+    #[test]
+    fn the_folder_must_be_apart_from_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let photos = base.join("photos");
+        fs::create_dir(&photos).unwrap();
+        std::os::unix::fs::symlink(&photos, base.join("link")).unwrap();
+        let apart = |dir: PathBuf| apart(&dir, &photos).is_ok();
+        assert!(apart(base.join("thumbnails")));
+        assert!(apart(base.join("state/thumbnails")));
+        assert!(apart(base.join("photos-thumbnails")));
+        for overlapping in [
+            photos.clone(),
+            photos.join("thumbnails"),
+            photos.join("album/thumbnails"),
+            base.clone(),
+            base.join("link/thumbnails"),
+            base.join("missing/../photos/thumbnails"),
+        ] {
+            assert!(!apart(overlapping.clone()), "{overlapping:?}");
+        }
+        let mut held: Vec<_> = fs::read_dir(&base)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        held.sort();
+        assert_eq!(held, ["link", "photos"]);
+        assert_eq!(fs::read_dir(&photos).unwrap().count(), 0);
+    }
+
+    /// A service whose folder is inside the library is refused, saying why;
+    /// one apart from it is kept.
+    #[test]
+    fn a_service_inside_the_library_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let (inside, _) = thumbnails("echo", &base);
+        let refused = inside.apart_from(&base).err().unwrap();
+        assert!(refused.ends_with(" and the library overlap"), "{refused}");
+        let photos = base.join("photos");
+        fs::create_dir(&photos).unwrap();
+        let (beside, _) = thumbnails("echo", &base);
+        assert!(beside.apart_from(&photos).is_ok());
+    }
+
+    /// An item folder that is a link isn't used, so a link into the library
+    /// can't have a file there replaced or removed: the thumbnail is made
+    /// but not kept, and what the link leads to stays as it was.
+    #[tokio::test]
+    async fn an_item_folder_that_is_a_link_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = original(dir.path(), JPEG);
+        let album = dir.path().join("album");
+        fs::create_dir(&album).unwrap();
+        fs::write(album.join("1-2.jpg"), b"a photo").unwrap();
+        fs::create_dir_all(cache(dir.path())).unwrap();
+        std::os::unix::fs::symlink(&album, cache(dir.path()).join("item")).unwrap();
+        let (thumbnails, log) = thumbnails("echo", dir.path());
+        assert_eq!(thumbnails.thumbnail("item", open(&video)).await, None);
+        assert_eq!(names(&album), ["1-2.jpg"]);
+        assert_eq!(fs::read(album.join("1-2.jpg")).unwrap(), b"a photo");
+        let lines = log.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("thumbnail item: made but not kept: "),
+            "{lines:?}"
+        );
     }
 
     /// A file with nothing to show is written down once, and not tried again
