@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 use std::{fs, io, path::Path};
 use subtle::ConstantTimeEq;
 
+/// What marks a temporary file of [`write_file_atomically`]: `<name>.tmp-<16 hex>`.
+pub const TEMPORARY_INFIX: &str = ".tmp-";
+
 pub type Digest = [u8; 32];
 
 pub fn sha256(data: &[u8]) -> Digest {
@@ -60,7 +63,7 @@ pub fn write_file_atomically(path: &Path, data: &[u8]) -> io::Result<()> {
     // A random suffix: every container's main process is PID 1, so a PID could
     // collide on a shared volume.
     let suffix = u64::from_le_bytes(random::<8>());
-    let temporary = path.with_file_name(format!("{file_name}.tmp-{suffix:016x}"));
+    let temporary = path.with_file_name(format!("{file_name}{TEMPORARY_INFIX}{suffix:016x}"));
     let written = fs::File::create(&temporary)
         .and_then(|mut file| file.write_all(data).and_then(|()| file.sync_all()))
         .and_then(|()| fs::rename(&temporary, path));
