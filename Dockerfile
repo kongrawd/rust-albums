@@ -9,7 +9,7 @@
 # Base images are pinned by digest, written literally (no ARG), so Dependabot
 # can open a pull request whenever one is rebuilt.
 
-FROM --platform=$BUILDPLATFORM rust:1.90-slim@sha256:7fa728f3678acf5980d5db70960cf8491aff9411976789086676bdf0c19db39e AS build
+FROM --platform=$BUILDPLATFORM rust:1.100-slim@sha256:e9d95b74296f7126a83ae3d041aeaba1ff4c478f13abc5cc034fcf7c131c3d4a AS build
 # Zig provides the C cross-compiler that ring needs for each target.
 ARG ZIG_VERSION=0.17.1
 ARG CARGO_ZIGBUILD_VERSION=0.24.1
