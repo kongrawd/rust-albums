@@ -138,6 +138,18 @@ fn thumbnails(settings: &config::Thumbnails) -> Option<thumbnail::service::Thumb
     }
 }
 
+/// Only the items of `snapshot`, as [`library::Library::run_scanner`] hands
+/// it over, keep their thumbnails.
+async fn keep_thumbnails_of(state: AppState, snapshot: Arc<library::Snapshot>) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(thumbnails) = &state.thumbnails {
+        let items = snapshot.item_ids().map(str::to_owned).collect();
+        thumbnails.keep_only(items).await;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = (state, snapshot);
+}
+
 async fn serve(
     config: config::Config,
     #[cfg(any(target_os = "linux", target_os = "macos"))] thumbnails: Option<
@@ -154,6 +166,13 @@ async fn serve(
                 .map_err(|e| format!("storage: {e}"))?
         }
     };
+    // Thumbnails are removed only in their folder: none if it overlaps the
+    // library, so the library never loses a file. Checked by hand.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let thumbnails = thumbnails.and_then(|thumbnails| {
+        let apart = thumbnails.apart_from(library.root());
+        apart.map_err(|err| eprintln!("thumbnails off: {err}")).ok()
+    });
     let credentials =
         auth::Credentials::new(&env_required("AUTH_USER")?, &env_required("AUTH_PASS")?)?;
     let tls = tls::load_or_create(&config.tls)?;
@@ -166,17 +185,25 @@ async fn serve(
         config.tls.min_version,
     );
     let sessions = Arc::new(session::Sessions::new(&config.session));
-    tokio::spawn(library.clone().run_scanner(config.storage.rescan_interval));
     tokio::spawn(sessions.clone().run_purger());
-    let app = web::router(Arc::new(App {
-        library,
+    let state = Arc::new(App {
+        library: library.clone(),
         credentials,
         sessions,
         hsts_max_age: config.tls.hsts_max_age,
         access_log: access_log::AccessLog::Stdout,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         thumbnails,
-    }));
+    });
+    // The snapshots the scanner hands over reach the thumbnails: checked by
+    // hand on a running server (a video removed, its album unreadable, the
+    // marker gone); the parts have tests.
+    let scanned = {
+        let state = state.clone();
+        move |snapshot| keep_thumbnails_of(state.clone(), snapshot)
+    };
+    tokio::spawn(library.run_scanner(config.storage.rescan_interval, scanned));
+    let app = web::router(state);
 
     let handle = Handle::new();
     tokio::spawn(shutdown_on_signal(handle.clone()));

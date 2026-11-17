@@ -219,6 +219,15 @@ mod tests {
         [pixels[at], pixels[at + 1], pixels[at + 2]]
     }
 
+    /// Making a thumbnail again gives the same bytes: what a cache name says
+    /// is the thumbnail, whenever it is made.
+    #[test]
+    fn the_same_video_gives_the_same_thumbnail() {
+        for video in [HEVC_DEMO, PORTRAIT, MAIN10] {
+            assert_eq!(thumbnail_of(video).unwrap(), thumbnail_of(video).unwrap());
+        }
+    }
+
     #[test]
     fn hevc_video_keeps_its_size_and_colours() {
         let (width, height, pixels) = decode_jpeg(&thumbnail_of(HEVC_DEMO).unwrap());

@@ -9,7 +9,10 @@
 //! I/O errors from a disconnected disk or network share) keeps the albums and
 //! link ids of the last successful scan and only marks storage unavailable, so
 //! an outage never looks like an empty root. Failed scans are retried sooner,
-//! with backoff, until one succeeds.
+//! with backoff, until one succeeds. Only the snapshots of scans that read the
+//! whole root are handed over (to the thumbnails), and only when their items
+//! changed: neither an outage nor a folder it couldn't read looks like items
+//! gone.
 //!
 //! Scans poll instead of watching for changes (notify/inotify): watching misses
 //! changes on NFS/SMB and from the Windows side of WSL2, and its polling
@@ -242,6 +245,11 @@ impl Library {
         }
     }
 
+    /// The root, canonical.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// The latest snapshot: cheap, never touches the disk.
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.snapshot
@@ -294,9 +302,31 @@ impl Library {
     /// Scans every `interval`; after a failed scan, retries sooner (starting at
     /// [`RETRY_AFTER_FAILURE`], doubling up to `interval`). Only one scan runs
     /// at a time. Runs until the process exits.
-    pub async fn run_scanner(self: Arc<Self>, interval: Duration) {
+    ///
+    /// `changed` is given the snapshot of the first scan that read the whole
+    /// root, then of each later one whose items differ from the last given; a
+    /// failed scan keeps the items, and one that couldn't read a folder lacks
+    /// its items. A folder never readable holds back every hand-over. It is
+    /// waited for before the next scan, so no newer snapshot exists while it
+    /// runs: only a request that looked its item up before can ask for an
+    /// item it wasn't given. A hung thumbnails folder stalls scans too.
+    pub async fn run_scanner<Changed: Future<Output = ()>>(
+        self: Arc<Self>,
+        interval: Duration,
+        mut changed: impl FnMut(Arc<Snapshot>) -> Changed,
+    ) {
+        let mut given: Option<Arc<Snapshot>> = None;
         let mut wait = interval;
         loop {
+            let scanned = self.snapshot();
+            if scanned.skipped.unreadable == 0
+                && given
+                    .as_ref()
+                    .is_none_or(|given| !scanned.has_the_items_of(given))
+            {
+                given = Some(scanned.clone());
+                changed(scanned).await;
+            }
             tokio::time::sleep(wait).await;
             let before = self.snapshot();
             let mut scan = self.spawn_scan();
@@ -530,6 +560,18 @@ impl Snapshot {
         let position = self.items_by_link_id.get(id)?;
         let album = self.albums.get(position.album)?;
         Some((album, album.items.get(position.item)?))
+    }
+
+    /// The link ids of the items served, as [`Self::item`] takes them, in no
+    /// order.
+    pub fn item_ids(&self) -> impl Iterator<Item = &str> {
+        self.items_by_link_id.keys().map(String::as_str)
+    }
+
+    /// Whether this snapshot has the same items as `other`, by link id.
+    fn has_the_items_of(&self, other: &Self) -> bool {
+        let (mine, theirs) = (&self.items_by_link_id, &other.items_by_link_id);
+        mine.len() == theirs.len() && mine.keys().all(|id| theirs.contains_key(id))
     }
 
     fn with_storage(&self, storage: StorageState) -> Self {
@@ -904,6 +946,81 @@ mod tests {
             "a.svg was just written; future.svg is shown"
         );
         assert_eq!(snapshot.skipped.still_copying, 1);
+    }
+
+    /// The scanner hands over the first scan's snapshot, then each one whose
+    /// items changed, but only from scans that read the whole root: neither
+    /// an outage nor an album it couldn't read looks like items gone. Scans
+    /// that change nothing hand over none.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_scanner_hands_over_each_change_of_items() {
+        use std::os::unix::fs::PermissionsExt;
+        let (base, library) = fixture().await;
+        let trip = base.path().join("root/Trip");
+        let home = base.path().join("root/Home");
+        fs::create_dir(&home).unwrap();
+        fs::write(home.join("c.svg"), "x").unwrap();
+        library.scan_now().unwrap();
+        let marker = base.path().join("root/.albums-root");
+        let (sender, mut changes) = tokio::sync::mpsc::unbounded_channel();
+        let scanner = tokio::spawn(library.clone().run_scanner(
+            Duration::from_millis(20),
+            move |snapshot: Arc<Snapshot>| {
+                let mut ids: Vec<_> = snapshot.item_ids().map(str::to_owned).collect();
+                ids.sort();
+                sender.send(ids).unwrap();
+                std::future::ready(())
+            },
+        ));
+        let ids = |paths: &[&str]| {
+            let mut ids: Vec<_> = paths
+                .iter()
+                .map(|path| library.link_ids.item(path))
+                .collect();
+            ids.sort();
+            ids
+        };
+        let next = async |changes: &mut tokio::sync::mpsc::UnboundedReceiver<_>| {
+            tokio::time::timeout(Duration::from_secs(5), changes.recv())
+                .await
+                .expect("a change handed over")
+                .unwrap()
+        };
+        // Waits for a snapshot that `holds`, then a few more scans.
+        let after = async |holds: &dyn Fn(&Snapshot) -> bool| {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !holds(&library.snapshot()) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the scanner got there");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(next(&mut changes).await, ids(&["Trip/a.svg", "Home/c.svg"]));
+
+        fs::remove_file(&marker).unwrap();
+        after(&|snapshot| !snapshot.storage.is_available()).await;
+        fs::write(&marker, "").unwrap();
+        after(&|snapshot| snapshot.storage.is_available()).await;
+        assert!(changes.try_recv().is_err(), "an outage handed over");
+
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o000)).unwrap();
+        after(&|snapshot| snapshot.skipped.unreadable > 0).await;
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+        after(&|snapshot| snapshot.skipped.unreadable == 0).await;
+        assert!(changes.try_recv().is_err(), "an unread album handed over");
+
+        fs::write(trip.join("b.svg"), "x").unwrap();
+        let all = ["Trip/a.svg", "Trip/b.svg", "Home/c.svg"];
+        assert_eq!(next(&mut changes).await, ids(&all));
+        fs::remove_file(trip.join("a.svg")).unwrap();
+        assert_eq!(next(&mut changes).await, ids(&all[1..]));
+        // As many items as before, but another one.
+        fs::rename(trip.join("b.svg"), trip.join("d.svg")).unwrap();
+        assert_eq!(next(&mut changes).await, ids(&["Trip/d.svg", "Home/c.svg"]));
+        scanner.abort();
     }
 
     #[tokio::test]

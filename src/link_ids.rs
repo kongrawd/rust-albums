@@ -28,9 +28,20 @@ use unicode_normalization::UnicodeNormalization;
 
 const KEY_BYTES: usize = 32;
 const ID_BYTES: usize = 16;
+/// Characters in an id: base64url of [`ID_BYTES`], without padding.
+pub const ID_LEN: usize = (ID_BYTES * 4).div_ceil(3);
 /// Version 1 of the id construction; a new version changes every id.
 const ALBUM_LABEL: &[u8] = b"rust-albums/v1/album\0";
 const ITEM_LABEL: &[u8] = b"rust-albums/v1/item\0";
+/// Whether `name` has the shape of a link id: [`ID_LEN`] characters of
+/// base64url.
+pub fn is_link_id(name: &str) -> bool {
+    name.len() == ID_LEN
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
 #[derive(Clone)]
 pub struct LinkIds {
     key: hmac::Key,
@@ -147,6 +158,34 @@ mod tests {
         // Another installation (another key) gives unrelated ids.
         let other = LinkIds::load_or_create(&dir.path().join("other.key")).unwrap();
         assert_ne!(other.item("Summer Trip/beach.jpg"), id);
+    }
+
+    /// Ids are told from other names by their shape alone: 22 URL-safe
+    /// characters, as the thumbnail cache tells its items' folders apart.
+    #[test]
+    fn link_ids_are_recognised_by_their_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = LinkIds::load_or_create(&dir.path().join("link.key")).unwrap();
+        for id in [ids.item("Trip/a.jpg"), ids.album("Trip")] {
+            assert!(is_link_id(&id), "{id}");
+        }
+        let id = "abcdefghijklmnopqrstu";
+        for name in [
+            String::new(),
+            "..".into(),
+            "link.key".into(),
+            id.into(),
+            format!("{id}AB"),
+            format!("{id}+"),
+            format!("{id}/"),
+            format!("{id}="),
+            format!("{id}.."),
+            // 22 bytes, but not 22 characters.
+            "abcdefghijklmnopqrst\u{e9}".into(),
+        ] {
+            assert!(!is_link_id(&name), "{name:?}");
+        }
+        assert!(is_link_id(&format!("{id}-")) && is_link_id(&format!("{id}_")));
     }
 
     #[test]
