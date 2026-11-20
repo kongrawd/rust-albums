@@ -17,6 +17,7 @@ mod healthcheck;
 mod html;
 mod library;
 mod link_ids;
+mod natural_order;
 mod pattern;
 mod plain_http;
 mod routes;

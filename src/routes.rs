@@ -29,51 +29,69 @@ const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
-/// The URL of an album, an item's page or an original, by link id. It is
-/// written out through `Display`, so pages render it without building a
-/// `String` per link (`to_string` gives one where needed). Link ids are already
-/// URL-safe (base64url), so they need no encoding.
+/// The URL of an album, an item's page or an original, by link id, with the
+/// link id of an item on that page as its fragment, if any. It is written out
+/// through `Display`, so pages render it without building a `String` per link
+/// (`to_string` gives one where needed). Link ids are already URL-safe
+/// (base64url), so they need no encoding.
 #[derive(Clone, Copy)]
 pub struct Link<'a> {
     prefix: &'static str,
     id: &'a str,
+    fragment: Option<&'a str>,
 }
 
 impl fmt::Display for Link<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.prefix)?;
-        f.write_str(self.id)
+        f.write_str(self.id)?;
+        match self.fragment {
+            Some(fragment) => {
+                f.write_str("#")?;
+                f.write_str(fragment)
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+impl<'a> Link<'a> {
+    /// This page scrolled to the element whose `id` is `item_id`, an item's
+    /// link id: an album at one of its tiles. Never a name, which would reach
+    /// the browser's history.
+    pub fn at(self, item_id: &'a str) -> Self {
+        Self {
+            fragment: Some(item_id),
+            ..self
+        }
+    }
+}
+
+/// The link to the URL `prefix` + `id`, without a fragment.
+const fn link<'a>(prefix: &'static str, id: &'a str) -> Link<'a> {
+    Link {
+        prefix,
+        id,
+        fragment: None,
     }
 }
 
 pub fn album_url(album_id: &str) -> Link<'_> {
-    Link {
-        prefix: ALBUM_PREFIX,
-        id: album_id,
-    }
+    link(ALBUM_PREFIX, album_id)
 }
 
 pub fn original_url(item_id: &str) -> Link<'_> {
-    Link {
-        prefix: ORIGINAL_PREFIX,
-        id: item_id,
-    }
+    link(ORIGINAL_PREFIX, item_id)
 }
 
 /// The page showing an item, as opposed to its original ([`original_url`]).
 pub fn item_page_url(item_id: &str) -> Link<'_> {
-    Link {
-        prefix: ITEM_PAGE_PREFIX,
-        id: item_id,
-    }
+    link(ITEM_PAGE_PREFIX, item_id)
 }
 
 /// An item's thumbnail, for items that have one (see `thumbnail::has_thumbnail`).
 pub fn thumbnail_url(item_id: &str) -> Link<'_> {
-    Link {
-        prefix: THUMBNAIL_PREFIX,
-        id: item_id,
-    }
+    link(THUMBNAIL_PREFIX, item_id)
 }
 
 /// The sign-in form, set to return to `target` (a local URL) afterwards.
@@ -107,6 +125,10 @@ mod tests {
         assert!(ITEM_PAGE.starts_with(ITEM_PAGE_PREFIX));
         assert!(THUMBNAIL.starts_with(THUMBNAIL_PREFIX));
         assert_eq!(album_url("q2bMf0-_x").to_string(), "/albums/q2bMf0-_x");
+        assert_eq!(
+            album_url("q2bMf0-_x").at("Zr9-_a").to_string(),
+            "/albums/q2bMf0-_x#Zr9-_a"
+        );
         assert_eq!(original_url("q2bMf0-_x").to_string(), "/media/q2bMf0-_x");
         assert_eq!(item_page_url("q2bMf0-_x").to_string(), "/items/q2bMf0-_x");
         assert_eq!(

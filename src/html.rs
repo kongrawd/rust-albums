@@ -6,7 +6,7 @@
 //! the templates simple, and album names and item file names are rendered
 //! only in the page body.
 
-use crate::library::{ALBUM_NAME_PLACEHOLDER, Album, Item, MediaKind, Snapshot};
+use crate::library::{ALBUM_NAME_PLACEHOLDER, Album, Item, ItemPlace, MediaKind, Snapshot};
 use crate::pattern::Metadata;
 use crate::{routes, thumbnail};
 use maud::{DOCTYPE, Escaper, Markup, PreEscaped, Render, html};
@@ -25,9 +25,22 @@ const FILE_NAME_PLACEHOLDER: &str = "file_name";
 /// Albums and items are square tiles in as many columns as fit, never fewer
 /// than two albums or three items per row (the minimum width comes from
 /// `--gap`), so phones stay compact. Items run edge to edge on narrow screens.
+/// A tile an item page led back to is outlined, with room above it to show
+/// where it sits. The pager keeps previous, place and next in fixed columns,
+/// so each stays put at the album's ends, and its links are 44px tall
+/// (WCAG 2.5.5 target size).
+///
+/// Every page is a column at least as tall as the screen (`svh`, which doesn't
+/// change as mobile toolbars hide; `vh` before it for older browsers). On an
+/// item page the photo or video takes the room its header, name and pager
+/// leave, whatever the screen and zoom, and never less than 12rem (or a third
+/// of a short screen), below which the page scrolls. It is placed absolutely
+/// in that stage, so its own size can't change the stage's while it loads, and
+/// `scale-down` fits it inside without ever enlarging it. Short screens,
+/// zoomed ones included, get a smaller heading.
 const STYLE: &str = "
 html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
-body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Noto Sans',sans-serif,'Apple Color Emoji','Segoe UI Emoji','Noto Color Emoji';margin:0 auto;max-width:1400px;padding:1rem;overflow-wrap:anywhere}
+body{box-sizing:border-box;min-height:100vh;min-height:100svh;display:flex;flex-direction:column;font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Noto Sans',sans-serif,'Apple Color Emoji','Segoe UI Emoji','Noto Color Emoji';margin:0 auto;max-width:1400px;padding:1rem;overflow-wrap:anywhere}
 a{color:inherit}button,input{font:inherit}img{display:block}
 .top{display:flex;align-items:center;justify-content:space-between;gap:1rem}.top h1{margin:.25rem 0}
 .muted{opacity:.75;margin:0}
@@ -37,13 +50,22 @@ a{color:inherit}button,input{font:inherit}img{display:block}
 .cover img,.tile img{width:100%;height:100%;object-fit:cover}
 .items{--gap:2px;display:grid;gap:var(--gap);grid-template-columns:repeat(auto-fill,minmax(min(7.5rem,calc((100% - 2*var(--gap))/3)),1fr));margin:.75rem -1rem 0}
 @media(min-width:40rem){.items{--gap:4px;margin-inline:0}}
-.tile{position:relative;display:block;aspect-ratio:1;background:#8882;overflow:hidden;text-decoration:none}
+.tile{position:relative;display:block;aspect-ratio:1;background:#8882;overflow:hidden;text-decoration:none;scroll-margin-top:20vh}
+.tile:target{outline:3px solid;outline-offset:-3px}
+.pager{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:.75rem;margin:.5rem 0}
+.pager a{display:flex;align-items:center;gap:.5rem;min-height:44px;text-decoration:none}
+.pager [rel=prev]{grid-column:1;justify-self:start}.pager [rel=next]{grid-column:3;justify-self:end;flex-direction:row-reverse}
+.pager img{width:44px;height:44px;object-fit:cover;border-radius:6px;background:#8882}
+.place{grid-column:2;opacity:.75}
 .play{position:absolute;inset:0;display:grid;place-items:center;font-size:1.5rem;opacity:.75}
 .caption{position:absolute;inset:auto 0 0;padding:1.25rem .4rem .25rem;font-size:.7rem;color:#fff;background:linear-gradient(#0000,#0009);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .chips{display:flex;flex-wrap:wrap;gap:.3rem;margin:.4rem 0}.chip{font-size:.75rem;background:#8883;border-radius:999px;padding:.1rem .5rem}
 .sign-in{display:grid;gap:.75rem;max-width:20rem}.sign-in input{display:block;width:100%;box-sizing:border-box}
 .error{color:#b00020}.name{font-size:1.25rem;font-weight:600;margin:.25rem 0}
-.view img,.view video{display:block;max-width:100%;max-height:80vh;margin:.75rem auto}
+.item{flex:1 0 auto;display:flex;flex-direction:column}
+.view{position:relative;flex:1 0 12rem;flex-basis:min(12rem,35vh);flex-basis:min(12rem,35svh);margin:.75rem 0}
+.view img,.view video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:scale-down}
+@media(max-height:32rem){body{padding-top:.5rem;padding-bottom:.5rem}.top h1{font-size:1.25rem;margin:0}.view{margin:.25rem 0}}
 @media(prefers-color-scheme:dark){.error{color:#ff8a80}}
 ";
 
@@ -53,6 +75,7 @@ pub fn sign_in_page(message: Option<&str>, next: &str) -> Markup {
     page(
         "Sign in",
         false,
+        Layout::Flow,
         html! {
             @if let Some(message) = message {
                 p.error { (message) }
@@ -72,6 +95,7 @@ pub fn album_list(snapshot: &Snapshot) -> Markup {
     page(
         "Albums",
         true,
+        Layout::Flow,
         html! {
             (storage_notice(snapshot))
             @if snapshot.albums.is_empty() {
@@ -81,8 +105,8 @@ pub fn album_list(snapshot: &Snapshot) -> Markup {
                 @for album in snapshot.albums.iter() {
                     a.album href=(routes::album_url(&album.id)) {
                         div.cover {
-                            @if let Some(cover) = album.items.iter().find_map(preview) {
-                                img loading="lazy" src=(cover) alt="";
+                            @if let Some(cover) = album.items.iter().find_map(tile_picture) {
+                                (picture_img(cover, Loading::Lazy))
                             }
                         }
                         h2 { (album.name) }
@@ -100,6 +124,7 @@ pub fn album_detail(snapshot: &Snapshot, album: &Album) -> Markup {
     page(
         "Album",
         true,
+        Layout::Flow,
         html! {
             (storage_notice(snapshot))
             p { a href=(routes::HOME) { "← All albums" } }
@@ -132,40 +157,106 @@ fn item_count(count: usize) -> String {
 }
 
 /// One item's page (title "Photo" or "Video"): the photo or the playable video,
-/// with a link opening its original in a new tab, for anything the browser
-/// can't show here.
-pub fn item_page(snapshot: &Snapshot, album: &Album, item: &Item) -> Markup {
+/// then its name, metadata and a link opening its original in a new tab, for
+/// anything the browser can't show here, and last the [`pager`] to the items
+/// beside it. A video shows its thumbnail until it plays, if it has one: iOS
+/// shows no frame of it before that.
+pub fn item_page(snapshot: &Snapshot, place: &ItemPlace) -> Markup {
+    let ItemPlace { album, item, .. } = place;
     let url = routes::original_url(&item.id);
     let (title, media) = match item.kind {
-        MediaKind::Image => ("Photo", html! { img src=(url) alt=(item.file_name); }),
+        // Fetched before the pager's pictures.
+        MediaKind::Image => (
+            "Photo",
+            html! { img src=(url) alt=(item.file_name) fetchpriority="high"; },
+        ),
         MediaKind::Video => (
             "Video",
-            html! { video controls playsinline preload="metadata" { source src=(url); } },
+            html! {
+                video controls playsinline preload="metadata" poster=[tile_picture(item)] {
+                    source src=(url);
+                }
+            },
         ),
     };
     page(
         title,
         true,
+        Layout::Item,
         html! {
             (storage_notice(snapshot))
-            p { a href=(routes::album_url(&album.id)) { "← " (album.name) } }
+            p { a href=(routes::album_url(&album.id).at(&item.id)) { "← " (album.name) } }
+            div.view { (media) }
             div.top {
                 p.name { (item.file_name) }
                 a href=(url) target="_blank" { "Open original" }
             }
             (metadata_chips(&item.metadata, FILE_NAME_PLACEHOLDER))
-            div.view { (media) }
+            (pager(place))
         },
     )
 }
 
-/// A square tile opening the item's page, showing its [`preview`] (a video's
-/// with a play glyph over it); its metadata is the tooltip.
+/// Links to the items before and after this one, each with the picture of its
+/// tile ([`tile_picture`]), and the item's place in the album. Its words are fixed,
+/// never names, and an end of the album simply has no link.
+fn pager(place: &ItemPlace) -> Markup {
+    html! {
+        nav.pager aria-label="Items" {
+            (pager_link(place.previous, &PREVIOUS))
+            span.place { (place.number()) " of " (place.count()) }
+            (pager_link(place.next, &NEXT))
+        }
+    }
+}
+
+/// One side of the [`pager`]: its link's `rel` and words, and when the
+/// picture of the item it leads to loads.
+struct PagerSide {
+    rel: &'static str,
+    label: &'static str,
+    loading: Loading,
+}
+
+/// The item before, likely just seen: its picture loads as the pager nears
+/// the screen.
+const PREVIOUS: PagerSide = PagerSide {
+    rel: "prev",
+    label: "← Previous",
+    loading: Loading::Lazy,
+};
+
+/// The item after: its picture loads with the page, so the next page has its
+/// photo at hand (a photo's picture is its original).
+const NEXT: PagerSide = PagerSide {
+    rel: "next",
+    label: "Next →",
+    loading: Loading::Eager,
+};
+
+/// A link of the [`pager`] to the item on `side`, if there is one; the styles
+/// put its picture on the outer side.
+fn pager_link(item: Option<&Item>, side: &PagerSide) -> Markup {
+    html! {
+        @if let Some(item) = item {
+            a rel=(side.rel) href=(routes::item_page_url(&item.id)) {
+                @if let Some(src) = tile_picture(item) {
+                    (picture_img(src, side.loading))
+                }
+                (side.label)
+            }
+        }
+    }
+}
+
+/// A square tile opening the item's page, showing its [`tile_picture`] (a video's
+/// with a play glyph over it); its metadata is the tooltip. Its `id`, the
+/// item's link id, is where the item's page leads back to.
 fn item_tile(item: &Item) -> Markup {
     html! {
-        a.tile href=(routes::item_page_url(&item.id)) title=(Tooltip(item)) {
-            @if let Some(src) = preview(item) {
-                img loading="lazy" src=(src) alt="";
+        a.tile id=(item.id) href=(routes::item_page_url(&item.id)) title=(Tooltip(item)) {
+            @if let Some(src) = tile_picture(item) {
+                (picture_img(src, Loading::Lazy))
             }
             @if item.kind == MediaKind::Video {
                 // U+FE0E: a text glyph, never a colour emoji.
@@ -176,11 +267,12 @@ fn item_tile(item: &Item) -> Markup {
     }
 }
 
-/// The URL of the image that tiles and album covers show for `item`, the one
-/// place deciding it (a video tile adds its play glyph on its own). A photo
-/// shows its original; a video its thumbnail, if it has one: never the video,
-/// as browsers can't lazy-load `<video>`.
-fn preview(item: &Item) -> Option<routes::Link<'_>> {
+/// The URL of the picture `item`'s tile shows, and so its album's cover, the
+/// pager and, for a video, its page until it plays: the one place deciding it
+/// (a video tile adds its play glyph on its own). A photo shows its original;
+/// a video its thumbnail, if it has one: never the video, as browsers can't
+/// lazy-load `<video>`.
+fn tile_picture(item: &Item) -> Option<routes::Link<'_>> {
     match item.kind {
         MediaKind::Image => Some(routes::original_url(&item.id)),
         MediaKind::Video if thumbnail::has_thumbnail(&item.path) => {
@@ -188,6 +280,23 @@ fn preview(item: &Item) -> Option<routes::Link<'_>> {
         }
         MediaKind::Video => None,
     }
+}
+
+/// When a picture loads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Loading {
+    /// As it nears the screen: grids hold many.
+    Lazy,
+    /// With the page.
+    Eager,
+}
+
+/// An item's [`tile_picture`], decorative: the link it is in is named by its
+/// words (the file name, the album name, or the pager's "Previous" and
+/// "Next").
+fn picture_img(src: routes::Link<'_>, loading: Loading) -> Markup {
+    let lazy = (loading == Loading::Lazy).then_some("lazy");
+    html! { img loading=[lazy] src=(src) alt=""; }
 }
 
 /// A tile's tooltip: the file name, then its metadata labels. Written straight
@@ -242,10 +351,20 @@ fn metadata_chips(metadata: &Metadata, already_shown: &str) -> Markup {
     }
 }
 
+/// How a page's content is laid out below its header (see [`STYLE`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    /// One block after another, as long as it needs.
+    Flow,
+    /// An item page's: its photo or video takes the room the rest leaves.
+    Item,
+}
+
 /// The shared page layout. `title` is `'static` because titles are fixed per
 /// page type, never built from data; the same string is the page heading.
 /// Signed-in pages get the sign-out button beside it.
-fn page(title: &'static str, signed_in: bool, body: Markup) -> Markup {
+fn page(title: &'static str, signed_in: bool, layout: Layout, body: Markup) -> Markup {
+    let class = (layout == Layout::Item).then_some("item");
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -263,7 +382,7 @@ fn page(title: &'static str, signed_in: bool, body: Markup) -> Markup {
                         (sign_out_button())
                     }
                 }
-                (body)
+                main class=[class] { (body) }
             }
         }
     }
