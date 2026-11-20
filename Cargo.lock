@@ -959,6 +959,7 @@ dependencies = [
  "axum-server",
  "base64 0.22.1",
  "flate2",
+ "form_urlencoded",
  "hyper",
  "hyper-util",
  "jpeg-decoder",

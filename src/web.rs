@@ -6,7 +6,7 @@ use crate::{AppState, access_log, html, library, routes, session};
 use axum::{
     Extension, Form, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header},
     middleware,
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -204,8 +204,11 @@ async fn sign_out(State(state): State<AppState>, headers: HeaderMap) -> Response
     (headers, Redirect::to(routes::SIGN_IN)).into_response()
 }
 
-async fn list_albums(State(state): State<AppState>) -> Markup {
-    html::album_list(&state.library.snapshot())
+/// The album list, sorted as its URL asks (see [`routes::album_sort`]).
+async fn list_albums(State(state): State<AppState>, uri: Uri) -> Markup {
+    let keys = state.library.sort_keys();
+    let sort = routes::album_sort(uri.query(), keys);
+    html::album_list(&state.library.snapshot(), keys, &sort)
 }
 
 async fn show_album(
@@ -767,6 +770,95 @@ mod tests {
             r#"<div class="chips"><span class="chip">seq: 001</span></div>"#.to_string(),
         ] {
             assert!(html.contains(&shown), "{shown}\n{html}");
+        }
+    }
+
+    /// The album list sorts as its URL asks: by folder (the default), name or a
+    /// folder placeholder, either way; ties keep folder order, and anything it
+    /// doesn't know or can't decode sorts by folder. (By creation: in the library's tests,
+    /// which control when files are written.)
+    #[tokio::test]
+    async fn the_album_list_sorts_as_asked() {
+        let files = [
+            ("2024/Zoo/a.svg", &b"x"[..]),
+            ("2023/Lake/a.svg", &b"x"[..]),
+            ("2023/Lake/b.svg", &b"x"[..]),
+            ("2025/attic/a.svg", &b"x"[..]),
+            ("2025/attic/b.svg", &b"x"[..]),
+            ("2025/attic/c.svg", &b"x"[..]),
+        ];
+        let (_dir, app, _ids, _log) = app_over("{year}/{album_name}/{file_name}", &files).await;
+        let cookie = session_cookie(&app).await;
+        for (query, expected) in [
+            ("", ["Lake", "Zoo", "attic"]),
+            ("?sort=folder&order=desc", ["attic", "Zoo", "Lake"]),
+            ("?sort=name", ["attic", "Lake", "Zoo"]),
+            ("?sort=name&order=desc", ["Zoo", "Lake", "attic"]),
+            ("?sort=year&order=desc", ["attic", "Zoo", "Lake"]),
+            // Number of items is no sort key.
+            ("?sort=items&order=desc", ["Lake", "Zoo", "attic"]),
+            ("?sort=album_name&order=up", ["Lake", "Zoo", "attic"]),
+            ("?sort=nothing", ["Lake", "Zoo", "attic"]),
+            // The first sort counts; one that doesn't decode is unknown.
+            ("?sort=name&sort=year&order=desc", ["Zoo", "Lake", "attic"]),
+            ("?sort=%FF&order=desc", ["Lake", "Zoo", "attic"]),
+        ] {
+            let url = format!("{}{query}", routes::HOME);
+            let html = body_text(send(&app, open(&url, Some(&cookie))).await).await;
+            let at = |name: &str| html.find(&format!("<h2>{name}</h2>")).unwrap();
+            let shown: Vec<_> = expected.iter().map(|name| at(name)).collect();
+            assert!(shown.is_sorted(), "{query}: {expected:?}\n{html}");
+        }
+    }
+
+    /// The album list links to each sort it offers: the current one marked, to
+    /// be reversed by following it again, with its direction said in words
+    /// too; the others ascending. Only keys and directions reach the URL.
+    #[tokio::test]
+    async fn the_album_list_links_to_its_sorts() {
+        let files = [
+            ("2024/Zoo/a.svg", &b"x"[..]),
+            ("2023/Lake/a.svg", &b"x"[..]),
+        ];
+        let (_dir, app, _ids, _log) = app_over("{year}/{album_name}/{file_name}", &files).await;
+        let cookie = session_cookie(&app).await;
+        let link = |key: &str| format!(r#"<a href="/?sort={key}">"#);
+        let current = |key: &str, href: &str, direction: &str, arrow: &str| {
+            format!(
+                r#"<a href="{href}" aria-current="true" aria-label="{key}, {direction}">{key} {arrow}</a>"#
+            )
+        };
+        for (query, shown) in [
+            (
+                "",
+                vec![
+                    r#"<nav class="sort" aria-label="Sort albums">"#.to_string(),
+                    current("folder", "/?sort=folder&amp;order=desc", "ascending", "↑"),
+                    link("name"),
+                    link("year"),
+                    link("created"),
+                ],
+            ),
+            (
+                "?sort=year",
+                vec![
+                    link("folder"),
+                    current("year", "/?sort=year&amp;order=desc", "ascending", "↑"),
+                ],
+            ),
+            (
+                "?sort=year&order=desc",
+                vec![current("year", "/?sort=year", "descending", "↓")],
+            ),
+        ] {
+            let url = format!("{}{query}", routes::HOME);
+            let html = body_text(send(&app, open(&url, Some(&cookie))).await).await;
+            for part in shown {
+                assert!(html.contains(&part), "{query}: {part}\n{html}");
+            }
+            // Neither `{album_name}` (name covers it) nor any value is a key.
+            let keys = ["sort=album_name", "sort=2024", "sort=Zoo"];
+            assert!(keys.iter().all(|key| !html.contains(key)), "{html}");
         }
     }
 

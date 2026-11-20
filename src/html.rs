@@ -6,7 +6,9 @@
 //! type: that keeps the templates simple, and album names and item file names
 //! are rendered only in the page body, where they are headings of their own.
 
-use crate::library::{ALBUM_NAME_PLACEHOLDER, Album, Item, ItemPlace, MediaKind, Snapshot};
+use crate::library::{
+    ALBUM_NAME_PLACEHOLDER, Album, AlbumSort, Item, ItemPlace, MediaKind, Snapshot, SortKey,
+};
 use crate::pattern::Metadata;
 use crate::{routes, thumbnail};
 use maud::{DOCTYPE, Escaper, Markup, PreEscaped, Render, html};
@@ -34,6 +36,11 @@ const FILE_NAME_PLACEHOLDER: &str = "file_name";
 /// and next in fixed columns, so each stays put at the album's ends, and its
 /// links are 44px tall (WCAG 2.5.5 target size).
 ///
+/// The album list's sort links wrap as a row; the current one is bold. Their
+/// text starts 1em below the header, as other pages' first line (a paragraph)
+/// does: the row's margin leaves out its links' padding, which is there to
+/// make them easier to tap.
+///
 /// Every page is a column at least as tall as the screen (`svh`, which doesn't
 /// change as mobile toolbars hide; `vh` before it for older browsers). On an
 /// item page the photo or video takes the room its header, name and pager
@@ -48,6 +55,7 @@ body{box-sizing:border-box;min-height:100vh;min-height:100svh;display:flex;flex-
 a{color:inherit}button,input{font:inherit}img{display:block}
 .top{display:flex;align-items:center;justify-content:space-between;gap:1rem}.top h1{margin:.25rem 0}
 .muted{opacity:.75;margin:0}
+.sort{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 1rem;margin:calc(1em - .4rem) 0 .75rem}.sort a{padding:.4rem 0}.sort [aria-current]{font-weight:600;text-decoration:none}
 .albums,.items{list-style:none;padding:0}
 .albums{--gap:.75rem;margin:0;display:grid;gap:1rem var(--gap);grid-template-columns:repeat(auto-fill,minmax(min(9.5rem,calc((100% - var(--gap))/2)),1fr))}
 .album{display:block;text-decoration:none}.album h2{font-size:1rem;margin:.4rem 0 0}
@@ -96,8 +104,9 @@ pub fn sign_in_page(message: Option<&str>, next: &str) -> Markup {
     )
 }
 
-/// The album list page (title "Albums").
-pub fn album_list(snapshot: &Snapshot) -> Markup {
+/// The album list page (title "Albums"), in `sort`'s order, with links to the
+/// other sorts among `keys`.
+pub fn album_list(snapshot: &Snapshot, keys: &[SortKey], sort: &AlbumSort) -> Markup {
     page(
         "Albums",
         true,
@@ -106,10 +115,12 @@ pub fn album_list(snapshot: &Snapshot) -> Markup {
             (storage_notice(snapshot))
             @if snapshot.albums.is_empty() {
                 p { "No albums found. Check the storage root and pattern." }
+            } @else {
+                (sort_links(keys, sort))
             }
             // `role="list"`: Safari drops the semantics of lists without bullets.
             ul.albums role="list" {
-                @for album in snapshot.albums.iter() {
+                @for album in snapshot.sorted_albums(sort) {
                     li {
                         a.album href=(routes::album_url(&album.id)) {
                             div.cover {
@@ -146,6 +157,36 @@ pub fn album_detail(snapshot: &Snapshot, album: &Album) -> Markup {
             }
         },
     )
+}
+
+/// Links sorting the album list by each of `keys`, each reading as its word in
+/// the URL (see [`routes::sort_word`]): lowercase, as placeholders read in the
+/// chips. The current one is marked and reverses the order; its direction is
+/// an arrow to see and, in its label, words to hear ("year, ascending", which
+/// keeps the visible word, as WCAG 2.5.3 asks). The others sort ascending.
+fn sort_links(keys: &[SortKey], sort: &AlbumSort) -> Markup {
+    html! {
+        nav.sort aria-label="Sort albums" {
+            "Sort by"
+            @for key in keys {
+                @let label = routes::sort_word(key);
+                @if *key == sort.key {
+                    @let (direction, arrow) = if sort.descending {
+                        ("descending", "↓")
+                    } else {
+                        ("ascending", "↑")
+                    };
+                    a href=(routes::album_list_url(key, !sort.descending))
+                        aria-current="true"
+                        aria-label={ (label) ", " (direction) } {
+                        (label) " " (arrow)
+                    }
+                } @else {
+                    a href=(routes::album_list_url(key, false)) { (label) }
+                }
+            }
+        }
+    }
 }
 
 /// Shown while the latest scan failed and the snapshot from the last

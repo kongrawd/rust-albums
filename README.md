@@ -62,7 +62,7 @@ In Docker, the listen address, photo folder and certificate names come from the 
 
 - **Signing in:** browsers use the sign-in page. A link you open while signed out takes you to sign in, then on to that link.
 - **Signing out:** the button at the top of every page.
-- **Browsing:** albums and items are listed in natural order (`IMG_9` before `IMG_10`). Each photo or video has Previous and Next, and going back to the album returns you to it.
+- **Browsing:** albums and items are listed in natural order (`IMG_9` before `IMG_10`). The album list can also be sorted by name, by folder details such as the year, or by when albums last got a new photo or video. Each photo or video has Previous and Next, and going back to the album returns you to it.
 - **Scripts and tools:** `curl -k -u user:pass https://localhost:8443/` works without the sign-in page (`-k` accepts the self-signed certificate).
 - **New photos** appear after the next scan, once they have finished copying.
 
