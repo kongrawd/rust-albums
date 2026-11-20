@@ -2,9 +2,9 @@
 //! every interpolated value is HTML-escaped automatically (the constant
 //! `STYLE` is the one exception). No JavaScript.
 //!
-//! Page titles and headings are fixed strings, one per page type: that keeps
-//! the templates simple, and album names and item file names are rendered
-//! only in the page body.
+//! Page titles and the page heading (`h1`) are fixed strings, one per page
+//! type: that keeps the templates simple, and album names and item file names
+//! are rendered only in the page body, where they are headings of their own.
 
 use crate::library::{ALBUM_NAME_PLACEHOLDER, Album, Item, ItemPlace, MediaKind, Snapshot};
 use crate::pattern::Metadata;
@@ -26,9 +26,13 @@ const FILE_NAME_PLACEHOLDER: &str = "file_name";
 /// than two albums or three items per row (the minimum width comes from
 /// `--gap`), so phones stay compact. Items run edge to edge on narrow screens.
 /// A tile an item page led back to is outlined, with room above it to show
-/// where it sits. The pager keeps previous, place and next in fixed columns,
-/// so each stays put at the album's ends, and its links are 44px tall
-/// (WCAG 2.5.5 target size).
+/// where it sits, and so is a tile with the keyboard's focus: inside the tile,
+/// as a ring outside would leave the screen at its edge, and in the text's
+/// color, as some browsers' own ring hardly shows on a photo. The two are
+/// separate rules: a browser that doesn't know `:focus-visible` drops the rule
+/// it is in, and keeps its own focus ring. The pager keeps previous, place
+/// and next in fixed columns, so each stays put at the album's ends, and its
+/// links are 44px tall (WCAG 2.5.5 target size).
 ///
 /// Every page is a column at least as tall as the screen (`svh`, which doesn't
 /// change as mobile toolbars hide; `vh` before it for older browsers). On an
@@ -44,14 +48,16 @@ body{box-sizing:border-box;min-height:100vh;min-height:100svh;display:flex;flex-
 a{color:inherit}button,input{font:inherit}img{display:block}
 .top{display:flex;align-items:center;justify-content:space-between;gap:1rem}.top h1{margin:.25rem 0}
 .muted{opacity:.75;margin:0}
-.albums{--gap:.75rem;display:grid;gap:1rem var(--gap);grid-template-columns:repeat(auto-fill,minmax(min(9.5rem,calc((100% - var(--gap))/2)),1fr))}
-.album{text-decoration:none}.album h2{font-size:1rem;margin:.4rem 0 0}
+.albums,.items{list-style:none;padding:0}
+.albums{--gap:.75rem;margin:0;display:grid;gap:1rem var(--gap);grid-template-columns:repeat(auto-fill,minmax(min(9.5rem,calc((100% - var(--gap))/2)),1fr))}
+.album{display:block;text-decoration:none}.album h2{font-size:1rem;margin:.4rem 0 0}
 .cover{aspect-ratio:1;border-radius:10px;overflow:hidden;background:#8882}
 .cover img,.tile img{width:100%;height:100%;object-fit:cover}
 .items{--gap:2px;display:grid;gap:var(--gap);grid-template-columns:repeat(auto-fill,minmax(min(7.5rem,calc((100% - 2*var(--gap))/3)),1fr));margin:.75rem -1rem 0}
 @media(min-width:40rem){.items{--gap:4px;margin-inline:0}}
 .tile{position:relative;display:block;aspect-ratio:1;background:#8882;overflow:hidden;text-decoration:none;scroll-margin-top:20vh}
 .tile:target{outline:3px solid;outline-offset:-3px}
+.tile:focus-visible{outline:3px solid;outline-offset:-3px}
 .pager{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:.75rem;margin:.5rem 0}
 .pager a{display:flex;align-items:center;gap:.5rem;min-height:44px;text-decoration:none}
 .pager [rel=prev]{grid-column:1;justify-self:start}.pager [rel=next]{grid-column:3;justify-self:end;flex-direction:row-reverse}
@@ -101,17 +107,20 @@ pub fn album_list(snapshot: &Snapshot) -> Markup {
             @if snapshot.albums.is_empty() {
                 p { "No albums found. Check the storage root and pattern." }
             }
-            div.albums {
+            // `role="list"`: Safari drops the semantics of lists without bullets.
+            ul.albums role="list" {
                 @for album in snapshot.albums.iter() {
-                    a.album href=(routes::album_url(&album.id)) {
-                        div.cover {
-                            @if let Some(cover) = album.items.iter().find_map(tile_picture) {
-                                (picture_img(cover, Loading::Lazy))
+                    li {
+                        a.album href=(routes::album_url(&album.id)) {
+                            div.cover {
+                                @if let Some(cover) = album.items.iter().find_map(tile_picture) {
+                                    (picture_img(cover, Loading::Lazy))
+                                }
                             }
+                            h2 { (album.name) }
+                            p.muted { (item_count(album.items.len())) }
+                            (metadata_chips(&album.metadata, ALBUM_NAME_PLACEHOLDER))
                         }
-                        h2 { (album.name) }
-                        p.muted { (item_count(album.items.len())) }
-                        (metadata_chips(&album.metadata, ALBUM_NAME_PLACEHOLDER))
                     }
                 }
             }
@@ -128,11 +137,11 @@ pub fn album_detail(snapshot: &Snapshot, album: &Album) -> Markup {
         html! {
             (storage_notice(snapshot))
             p { a href=(routes::HOME) { "← All albums" } }
-            p.name { (album.name) }
+            h2.name { (album.name) }
             (metadata_chips(&album.metadata, ALBUM_NAME_PLACEHOLDER))
-            div.items {
+            ul.items role="list" {
                 @for item in &album.items {
-                    (item_tile(item))
+                    li { (item_tile(item)) }
                 }
             }
         },
@@ -188,7 +197,7 @@ pub fn item_page(snapshot: &Snapshot, place: &ItemPlace) -> Markup {
             p { a href=(routes::album_url(&album.id).at(&item.id)) { "← " (album.name) } }
             div.view { (media) }
             div.top {
-                p.name { (item.file_name) }
+                h2.name { (item.file_name) }
                 a href=(url) target="_blank" { "Open original" }
             }
             (metadata_chips(&item.metadata, FILE_NAME_PLACEHOLDER))

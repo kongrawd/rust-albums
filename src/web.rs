@@ -763,7 +763,7 @@ mod tests {
         let page = routes::item_page_url(&photo_id).to_string();
         let html = body_text(send(&app, open(&page, Some(&cookie))).await).await;
         for shown in [
-            format!(r#"<p class="name">{name}</p>"#),
+            format!(r#"<h2 class="name">{name}</h2>"#),
             r#"<div class="chips"><span class="chip">seq: 001</span></div>"#.to_string(),
         ] {
             assert!(html.contains(&shown), "{shown}\n{html}");
@@ -1497,7 +1497,7 @@ mod tests {
         let cookie = session_cookie(&app).await;
         let html = body_text(send(&app, open(&links.photo_page, Some(&cookie))).await).await;
         let at = |part: &str| html.find(part).unwrap_or_else(|| panic!("{part}\n{html}"));
-        let (media, name) = (at(r#"<div class="view">"#), at(r#"<p class="name">"#));
+        let (media, name) = (at(r#"<div class="view">"#), at(r#"<h2 class="name">"#));
         let (original, pager) = (at(">Open original<"), at(r#"<nav class="pager""#));
         assert!(
             media < name && name < original && original < pager,
@@ -1582,6 +1582,28 @@ mod tests {
         );
     }
 
+    /// The album list and an album's grid are lists, so screen readers say how
+    /// many albums or items they hold. (Names as headings: the tests of what
+    /// each page shows.)
+    #[tokio::test]
+    async fn album_and_item_grids_are_lists() {
+        let (_dir, app, links) = app().await;
+        let cookie = session_cookie(&app).await;
+        for (page, list) in [
+            (
+                routes::HOME,
+                r#"<ul class="albums" role="list"><li><a class="album""#,
+            ),
+            (
+                &links.album,
+                r#"<ul class="items" role="list"><li><a class="tile""#,
+            ),
+        ] {
+            let html = body_text(send(&app, open(page, Some(&cookie))).await).await;
+            assert!(html.contains(list), "{list}\n{html}");
+        }
+    }
+
     /// Album pages take album link ids, and nothing else: among several
     /// albums, each opens by its own id.
     #[tokio::test]
@@ -1594,7 +1616,7 @@ mod tests {
             let response = send(&app, open(&page, Some(&cookie))).await;
             assert_eq!(response.status(), StatusCode::OK, "{page}");
             let html = body_text(response).await;
-            let shown = format!(r#"<p class="name">{name}</p>"#);
+            let shown = format!(r#"<h2 class="name">{name}</h2>"#);
             assert!(html.contains(&shown), "{html}");
         }
         let photo_id = links.photo.trim_start_matches("/media/");
