@@ -21,13 +21,17 @@
 use crate::config;
 use crate::link_ids::LinkIds;
 use crate::pattern::{Captures, Metadata, Pattern};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::{natural_order, routes};
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fmt;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
-use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 use walkdir::WalkDir;
 
 /// A scan taking longer than this marks storage unavailable (hung mount).
@@ -58,6 +62,8 @@ pub struct Library {
     /// Lowercase, so matching is case-insensitive.
     ignore: HashSet<String>,
     link_ids: LinkIds,
+    /// What the album list can be sorted by (see [`sort_keys`]).
+    sort_keys: Vec<SortKey>,
     snapshot: RwLock<Arc<Snapshot>>,
 }
 
@@ -78,6 +84,60 @@ pub struct Snapshot {
 struct ItemPosition {
     album: usize,
     item: usize,
+}
+
+/// An item's place in its album, for its page: between the items before and
+/// after it, and its number there.
+pub struct ItemPlace<'a> {
+    pub album: &'a Album,
+    pub item: &'a Item,
+    /// The item before it, if it isn't the album's first.
+    pub previous: Option<&'a Item>,
+    /// The item after it, if it isn't the album's last.
+    pub next: Option<&'a Item>,
+    /// Where it sits in `album.items`, from 0.
+    index: usize,
+}
+
+impl ItemPlace<'_> {
+    /// Its place in the album as people count, from 1.
+    pub fn number(&self) -> usize {
+        self.index + 1
+    }
+
+    /// How many items its album holds, as its grid shows them.
+    pub fn count(&self) -> usize {
+        self.album.items.len()
+    }
+}
+
+/// How the album list is sorted, as its URL asks (see [`Snapshot::album_sort`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AlbumSort {
+    pub key: SortKey,
+    pub descending: bool,
+}
+
+/// What the album list can be sorted by. Values compare in [`natural_order`],
+/// and ties keep folder order.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SortKey {
+    /// The order of their folders: the default.
+    Folder,
+    Name,
+    /// A placeholder of the albums' folders, e.g. `year`.
+    Placeholder(String),
+    /// When their newest item was created (see [`Album::newest_item`]).
+    Created,
+}
+
+impl Default for AlbumSort {
+    fn default() -> Self {
+        Self {
+            key: SortKey::Folder,
+            descending: false,
+        }
+    }
 }
 
 /// Outcome of the latest scan. The reasons are generic on purpose: they are
@@ -133,6 +193,14 @@ pub struct Album {
     pub items: Vec<Item>,
 }
 
+impl Album {
+    /// When its newest item was created (see [`Item::created`]), if it has
+    /// any: from the items it lists, so never from one it refused.
+    pub fn newest_item(&self) -> Option<SystemTime> {
+        self.items.iter().map(|item| item.created).max()
+    }
+}
+
 pub struct Item {
     /// Link id, used in URLs.
     pub id: String,
@@ -143,6 +211,10 @@ pub struct Item {
     pub file_name: String,
     pub kind: MediaKind,
     pub metadata: Metadata,
+    /// When its file was created, or last modified where creation times
+    /// aren't kept: on some file systems, and with Rust's standard library on
+    /// musl (so in the Docker image), which reads them only through glibc.
+    pub created: SystemTime,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -203,9 +275,11 @@ impl Library {
                 settings.root.display()
             )
         })?;
+        let pattern = Pattern::parse(&settings.pattern)?;
         let library = Arc::new(Self {
             root,
-            pattern: Pattern::parse(&settings.pattern)?,
+            sort_keys: sort_keys(&pattern),
+            pattern,
             marker: settings.marker.clone(),
             settle_time: settings.settle_time,
             ignore: settings
@@ -250,6 +324,12 @@ impl Library {
         &self.root
     }
 
+    /// What the album list can be sorted by: the same for every snapshot, as
+    /// the pattern is.
+    pub fn sort_keys(&self) -> &[SortKey] {
+        &self.sort_keys
+    }
+
     /// The latest snapshot: cheap, never touches the disk.
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.snapshot
@@ -283,13 +363,7 @@ impl Library {
                         self.root.display()
                     );
                 }
-                self.replace_snapshot(Snapshot {
-                    albums_by_link_id: Arc::new(index_albums(&albums)),
-                    items_by_link_id: Arc::new(index_items(&albums)),
-                    albums: Arc::new(albums),
-                    storage: StorageState::Available,
-                    skipped,
-                });
+                self.replace_snapshot(Snapshot::new(albums, skipped));
                 Ok(())
             }
             Err(error) => {
@@ -418,7 +492,7 @@ impl Library {
         let walker = WalkDir::new(&self.root)
             .max_depth(depth)
             .follow_links(false)
-            .sort_by_file_name()
+            .sort_by(|a, b| by_name(a.file_name(), b.file_name()))
             .into_iter()
             .filter_entry(|entry| {
                 entry.depth() == 0
@@ -427,7 +501,10 @@ impl Library {
 
         let now = SystemTime::now();
         let mut skipped = Skipped::default();
-        let mut albums: BTreeMap<String, Album> = BTreeMap::new();
+        let mut albums: Vec<Album> = Vec::new();
+        // Where each album sits in `albums`, by album path: albums keep the
+        // order the walk finds them in.
+        let mut positions: HashMap<String, usize> = HashMap::new();
         for entry in walker {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -456,11 +533,15 @@ impl Library {
             let Some((kind, captured)) = self.classify(&segments) else {
                 continue;
             };
-            let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
-            let Some(modified) = modified else {
+            // The file system's details: not the item's metadata, which come
+            // from placeholders.
+            let file_info = entry.metadata().ok();
+            let modified = file_info.as_ref().and_then(|info| info.modified().ok());
+            let (Some(file_info), Some(modified)) = (file_info, modified) else {
                 skipped.unreadable += 1;
                 continue;
             };
+            let created = file_info.created().unwrap_or(modified);
             // A modification time in the future (a wrong camera clock) counts as settled.
             if now
                 .duration_since(modified)
@@ -473,33 +554,36 @@ impl Library {
             let (folders, last) = segments.split_at(segments.len() - 1);
             let file_name = last[0];
             let album_path = folders.join("/");
-            let album = albums.entry(album_path.clone()).or_insert_with(|| {
-                let metadata = composed_metadata(captured.album_metadata);
-                Album {
-                    id: self.link_ids.album(&album_path),
-                    name: metadata
-                        .get(ALBUM_NAME_PLACEHOLDER)
-                        .cloned()
-                        .unwrap_or_else(|| composed(folders[folders.len() - 1])),
-                    metadata,
-                    items: Vec::new(),
-                }
-            });
+            let position = *positions
+                .entry(album_path)
+                .or_insert_with_key(|album_path| {
+                    let metadata = composed_metadata(captured.album_metadata);
+                    albums.push(Album {
+                        id: self.link_ids.album(album_path),
+                        name: metadata
+                            .get(ALBUM_NAME_PLACEHOLDER)
+                            .cloned()
+                            .unwrap_or_else(|| composed(folders[folders.len() - 1]).into_owned()),
+                        metadata,
+                        items: Vec::new(),
+                    });
+                    albums.len() - 1
+                });
+            let album = &mut albums[position];
             let item_path = segments.join("/");
             album.items.push(Item {
                 id: self.link_ids.item(&item_path),
                 path: item_path,
-                file_name: composed(file_name),
+                file_name: composed(file_name).into_owned(),
                 kind,
                 metadata: composed_metadata(captured.item_metadata),
+                created,
             });
         }
         // The mount may have dropped mid-walk, leaving only part of the root.
         self.check_marker()?;
-        Ok((
-            refuse_shared_album_ids(albums.into_values().collect()),
-            skipped,
-        ))
+        let albums = refuse_shared_item_ids(refuse_shared_album_ids(albums));
+        Ok((albums, skipped))
     }
 
     /// The marker must be a regular file, not a symlink (symlinks are skipped).
@@ -549,6 +633,17 @@ impl Library {
 }
 
 impl Snapshot {
+    /// The snapshot of a successful scan that found `albums`.
+    fn new(albums: Vec<Album>, skipped: Skipped) -> Self {
+        Self {
+            albums_by_link_id: Arc::new(index_albums(&albums)),
+            items_by_link_id: Arc::new(index_items(&albums)),
+            albums: Arc::new(albums),
+            storage: StorageState::Available,
+            skipped,
+        }
+    }
+
     /// The album with this link id.
     pub fn album(&self, id: &str) -> Option<&Album> {
         self.albums.get(*self.albums_by_link_id.get(id)?)
@@ -557,9 +652,70 @@ impl Snapshot {
     /// The item with this link id and its album. Only link ids whose file is
     /// served count: a link id shared by two items is refused for both.
     pub fn item(&self, id: &str) -> Option<(&Album, &Item)> {
+        let (album, index) = self.item_position(id)?;
+        Some((album, album.items.get(index)?))
+    }
+
+    /// The item with this link id, as [`Self::item`] finds it, in its place in
+    /// its album.
+    pub fn item_place(&self, id: &str) -> Option<ItemPlace<'_>> {
+        let (album, index) = self.item_position(id)?;
+        let (before, from_item) = album.items.split_at_checked(index)?;
+        let (item, after) = from_item.split_first()?;
+        Some(ItemPlace {
+            album,
+            item,
+            previous: before.last(),
+            next: after.first(),
+            index,
+        })
+    }
+
+    /// The album of the item with this link id, if it is served, and the
+    /// item's place in `album.items`.
+    fn item_position(&self, id: &str) -> Option<(&Album, usize)> {
         let position = self.items_by_link_id.get(id)?;
-        let album = self.albums.get(position.album)?;
-        Some((album, album.items.get(position.item)?))
+        Some((self.albums.get(position.album)?, position.item))
+    }
+
+    /// The albums in `sort`'s order. The sort is stable and by key only, so
+    /// ties keep folder order either way; values are composed already, and
+    /// compare without allocating.
+    pub fn sorted_albums(&self, sort: &AlbumSort) -> Vec<&Album> {
+        fn value<'a>(album: &'a Album, placeholder: &str) -> &'a str {
+            album.metadata.get(placeholder).map_or("", String::as_str)
+        }
+        let ordered = |ordering: Ordering| {
+            if sort.descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        };
+        let mut albums: Vec<&Album> = self.albums.iter().collect();
+        match &sort.key {
+            SortKey::Folder if sort.descending => albums.reverse(),
+            SortKey::Folder => {}
+            SortKey::Name => {
+                albums.sort_by(|a, b| ordered(natural_order::compare(&a.name, &b.name)));
+            }
+            SortKey::Placeholder(placeholder) => albums.sort_by(|a, b| {
+                ordered(natural_order::compare(
+                    value(a, placeholder),
+                    value(b, placeholder),
+                ))
+            }),
+            // Each album's date is found once, not at every comparison.
+            SortKey::Created => {
+                let mut dated: Vec<_> = albums
+                    .iter()
+                    .map(|album| (album.newest_item(), *album))
+                    .collect();
+                dated.sort_by(|(a, _), (b, _)| ordered(a.cmp(b)));
+                albums = dated.into_iter().map(|(_, album)| album).collect();
+            }
+        }
+        albums
     }
 
     /// The link ids of the items served, as [`Self::item`] takes them, in no
@@ -596,9 +752,9 @@ fn is_storage_failure(err: &io::Error) -> bool {
 }
 
 /// Link ids that appear more than once, logged: such albums or items are
-/// refused rather than showing the wrong one. Album ids are computed from
-/// NFC-normalised paths, so two folders whose names differ only in Unicode
-/// form (possible on Linux) share one; item ids practically never do.
+/// refused rather than showing the wrong one. Link ids are computed from
+/// NFC-normalised paths, so two folders, or two files in one folder, whose
+/// names differ only in Unicode form (possible on Linux) share one.
 fn shared_link_ids<'a>(kind: &str, ids: impl Iterator<Item = &'a str>) -> HashSet<String> {
     let mut seen = HashSet::new();
     let shared: HashSet<String> = ids
@@ -611,18 +767,80 @@ fn shared_link_ids<'a>(kind: &str, ids: impl Iterator<Item = &'a str>) -> HashSe
     shared
 }
 
-/// A name as shown on the pages: composed (NFC), as macOS and SMB clients often
-/// write names decomposed (`e` plus a combining accent), which some fonts draw
-/// misplaced. Item paths keep the name as on disk, so files still open.
-fn composed(name: &str) -> String {
-    name.nfc().collect()
+/// A name as shown on the pages and as sorted: composed (NFC), as macOS and
+/// SMB clients often write names decomposed (`e` plus a combining accent),
+/// which some fonts draw misplaced. Item paths keep the name as on disk, so
+/// files still open. Most names are composed already, which a quick check
+/// tells without building another string.
+fn composed(name: &str) -> Cow<'_, str> {
+    match is_nfc_quick(name.chars()) {
+        IsNormalized::Yes => Cow::Borrowed(name),
+        IsNormalized::No | IsNormalized::Maybe => Cow::Owned(name.nfc().collect()),
+    }
 }
 
 fn composed_metadata(metadata: Metadata) -> Metadata {
     metadata
         .into_iter()
-        .map(|(placeholder, value)| (placeholder, composed(&value)))
+        .map(|(placeholder, value)| (placeholder, composed(&value).into_owned()))
         .collect()
+}
+
+/// What the album list can be sorted by: folder, name, each placeholder of the
+/// pattern's folders in its order, and creation. `{album_name}` is left out,
+/// as name covers it, and so is a placeholder whose name is one of the fixed
+/// sorts' words in the URL, which the log says once.
+fn sort_keys(pattern: &Pattern) -> Vec<SortKey> {
+    let fixed = [SortKey::Folder, SortKey::Name, SortKey::Created];
+    let placeholders = pattern
+        .album_placeholders()
+        .filter(|placeholder| *placeholder != ALBUM_NAME_PLACEHOLDER)
+        .map(|placeholder| SortKey::Placeholder(placeholder.to_string()))
+        .filter(|key| {
+            let word = routes::sort_word(key);
+            let clashes = fixed.iter().any(|fixed| routes::sort_word(fixed) == word);
+            if clashes {
+                eprintln!("placeholder {{{word}}} doesn't sort the album list: \"{word}\" is one of its own sorts");
+            }
+            !clashes
+        });
+    let mut keys: Vec<_> = fixed[..2].to_vec();
+    keys.extend(placeholders);
+    keys.push(SortKey::Created);
+    keys
+}
+
+/// The order of a folder's entries in the walk: by name, in [`natural_order`].
+/// walkdir sorts each folder's entries and walks depth first, so albums and
+/// their items come out in that order, folder by folder: the order pages list
+/// them in, and that an item page's previous and next follow. Names compare
+/// [`composed`], so one sorts the same in either Unicode form, as Unicode asks
+/// of equivalent text; two that differ only in form fall back to their bytes.
+/// Names that aren't UTF-8 (skipped anyway) come last, in byte order, so the
+/// order stays total, as sorting requires.
+fn by_name(a: &OsStr, b: &OsStr) -> Ordering {
+    match (a.to_str(), b.to_str()) {
+        (Some(a), Some(b)) => {
+            natural_order::compare(&composed(a), &composed(b)).then_with(|| a.cmp(b))
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => a.cmp(b),
+    }
+}
+
+/// The albums without their items that share a link id (see
+/// [`shared_link_ids`]), so an album lists only items that have a page: its
+/// tiles' `id`s stay unique, and its item numbers and each item's previous and
+/// next count only those. An album left with no items stays, empty: it is a
+/// folder the scan found, and the log says why its items are gone.
+fn refuse_shared_item_ids(mut albums: Vec<Album>) -> Vec<Album> {
+    let items = albums.iter().flat_map(|album| &album.items);
+    let shared = shared_link_ids("item", items.map(|item| item.id.as_str()));
+    for album in &mut albums {
+        album.items.retain(|item| !shared.contains(&item.id));
+    }
+    albums
 }
 
 fn refuse_shared_album_ids(albums: Vec<Album>) -> Vec<Album> {
@@ -642,27 +860,21 @@ fn index_albums(albums: &[Album]) -> HashMap<String, usize> {
         .collect()
 }
 
-/// Each item's position by link id, without shared link ids.
+/// Each item's position by link id. Items sharing one were already refused
+/// (see [`refuse_shared_item_ids`]).
 fn index_items(albums: &[Album]) -> HashMap<String, ItemPosition> {
-    let items = || {
-        albums.iter().enumerate().flat_map(|(album_index, album)| {
-            album
-                .items
-                .iter()
-                .enumerate()
-                .map(move |(item_index, item)| {
-                    let position = ItemPosition {
-                        album: album_index,
-                        item: item_index,
-                    };
-                    (position, item)
-                })
+    let albums = albums.iter().enumerate();
+    albums
+        .flat_map(|(album_index, album)| {
+            let items = album.items.iter().enumerate();
+            items.map(move |(item_index, item)| {
+                let position = ItemPosition {
+                    album: album_index,
+                    item: item_index,
+                };
+                (item.id.clone(), position)
+            })
         })
-    };
-    let shared = shared_link_ids("item", items().map(|(_, item)| item.id.as_str()));
-    items()
-        .filter(|(_, item)| !shared.contains(&item.id))
-        .map(|(position, item)| (item.id.clone(), position))
         .collect()
 }
 
@@ -827,6 +1039,99 @@ mod tests {
         assert_eq!(item.file_name, "001_a.svg");
         assert_eq!(item.metadata["seq"], "001");
         assert_eq!(item.metadata["file_name"], "a.svg");
+    }
+
+    /// Albums and items are listed as people count: numbers by value, letters
+    /// regardless of case.
+    #[tokio::test]
+    async fn albums_and_items_come_in_natural_order() {
+        let base = tempfile::tempdir().unwrap();
+        fs::write(base.path().join(".albums-root"), "").unwrap();
+        for album in ["Trip 10", "Trip 9", "lake"] {
+            fs::create_dir_all(base.path().join(album)).unwrap();
+        }
+        for item in ["IMG_10.svg", "IMG_9.svg", "img_1.svg", "IMG_009b.svg"] {
+            fs::write(base.path().join("lake").join(item), "x").unwrap();
+        }
+        fs::write(base.path().join("Trip 10/a.svg"), "x").unwrap();
+        fs::write(base.path().join("Trip 9/a.svg"), "x").unwrap();
+        let pattern = "{album_name}/{file_name}";
+        let library = library(base.path(), &settings(base.path(), pattern)).await;
+        let snapshot = library.snapshot();
+        let names: Vec<_> = snapshot.albums.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["lake", "Trip 9", "Trip 10"]);
+        let items = snapshot.albums[0].items.iter();
+        let files: Vec<_> = items.map(|i| i.file_name.as_str()).collect();
+        assert_eq!(
+            files,
+            ["img_1.svg", "IMG_9.svg", "IMG_009b.svg", "IMG_10.svg"]
+        );
+    }
+
+    /// The album list sorts by folder, name, the pattern's folder placeholders
+    /// in its order, and creation; `{album_name}` is name, and a placeholder
+    /// named like a fixed sort is left out.
+    #[test]
+    fn the_album_list_sorts_by_the_patterns_placeholders() {
+        let pattern = Pattern::parse("{year}/{name}/{date}_{album_name}/{file_name}").unwrap();
+        let date = SortKey::Placeholder("date".into());
+        let year = SortKey::Placeholder("year".into());
+        assert_eq!(
+            sort_keys(&pattern),
+            [SortKey::Folder, SortKey::Name, year, date, SortKey::Created]
+        );
+    }
+
+    /// Albums sort by when their newest item was created: here `Zoo`, as its
+    /// second file came last. Files are written 20ms apart, past the clocks of
+    /// the file systems tests run on (APFS, ext4, tmpfs; HFS+ and FAT keep
+    /// coarser times), so creation and modification times agree on the order.
+    #[tokio::test]
+    async fn albums_sort_by_their_newest_item() {
+        let base = tempfile::tempdir().unwrap();
+        fs::write(base.path().join(".albums-root"), "").unwrap();
+        for file in ["Zoo/a.svg", "Lake/a.svg", "attic/a.svg", "Zoo/b.svg"] {
+            let file = base.path().join(file);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, "x").unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pattern = "{album_name}/{file_name}";
+        let library = library(base.path(), &settings(base.path(), pattern)).await;
+        let snapshot = library.snapshot();
+        for (descending, expected) in [
+            (false, ["Lake", "attic", "Zoo"]),
+            (true, ["Zoo", "attic", "Lake"]),
+        ] {
+            let sort = AlbumSort {
+                key: SortKey::Created,
+                descending,
+            };
+            let albums = snapshot.sorted_albums(&sort);
+            let names: Vec<_> = albums.iter().map(|album| album.name.as_str()).collect();
+            assert_eq!(names, expected, "descending: {descending}");
+        }
+    }
+
+    /// A name sorts the same whether it is stored composed (`É`) or decomposed
+    /// (`E` plus an accent), as Unicode asks of equivalent text.
+    #[tokio::test]
+    async fn names_sort_alike_in_either_unicode_form() {
+        let base = tempfile::tempdir().unwrap();
+        fs::write(base.path().join(".albums-root"), "").unwrap();
+        fs::create_dir_all(base.path().join("lake")).unwrap();
+        for item in ["Zoo.svg", "E\u{301}cole.svg", "Eden.svg", "\u{c9}tude.svg"] {
+            fs::write(base.path().join("lake").join(item), "x").unwrap();
+        }
+        let pattern = "{album_name}/{file_name}";
+        let library = library(base.path(), &settings(base.path(), pattern)).await;
+        let snapshot = library.snapshot();
+        let items = snapshot.albums[0].items.iter();
+        let files: Vec<_> = items.map(|i| i.file_name.as_str()).collect();
+        assert_eq!(
+            files,
+            ["Eden.svg", "Zoo.svg", "\u{c9}cole.svg", "\u{c9}tude.svg"]
+        );
     }
 
     /// macOS and SMB clients often write names decomposed (NFD): `e` plus a
@@ -1049,6 +1354,61 @@ mod tests {
         ]);
         let names: Vec<_> = kept.iter().map(|album| album.name.as_str()).collect();
         assert_eq!(names, ["Lake"]);
+    }
+
+    /// Items sharing a link id are refused, as albums are: their album lists
+    /// neither, so its tiles, item numbers and previous and next all count
+    /// only items that have a page. An album whose items are all refused stays,
+    /// empty: it is a folder the scan found.
+    #[test]
+    fn items_sharing_a_link_id_are_refused() {
+        // The shared items are the newest: refused, they mustn't date the album.
+        let created = |id: &str| {
+            let seconds = if id == "shared" { 9 } else { id.len() as u64 };
+            SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
+        };
+        let item = |id: &str| Item {
+            id: id.into(),
+            path: format!("Trip/{id}.svg"),
+            file_name: format!("{id}.svg"),
+            kind: MediaKind::Image,
+            metadata: Metadata::new(),
+            created: created(id),
+        };
+        let album = |id: &str, items: &[&str]| Album {
+            id: id.into(),
+            name: id.into(),
+            metadata: Metadata::new(),
+            items: items.iter().map(|id| item(id)).collect(),
+        };
+        let albums = vec![
+            album("trip", &["a", "shared", "b", "shared", "c"]),
+            album("twins", &["twin", "twin"]),
+        ];
+        let snapshot = Snapshot::new(refuse_shared_item_ids(albums), Skipped::default());
+        let items = snapshot.albums[0].items.iter();
+        let ids: Vec<_> = items.map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+        let twins = snapshot.album("twins").unwrap();
+        assert!(twins.items.is_empty());
+        // Dated by the items they list, and undated when they list none.
+        let trip = snapshot.album("trip").unwrap();
+        assert_eq!(trip.newest_item(), Some(created("a")));
+        assert_eq!(twins.newest_item(), None);
+        fn id(item: Option<&Item>) -> Option<&str> {
+            item.map(|item| item.id.as_str())
+        }
+        for (item, number, previous, next) in [
+            ("a", 1, None, Some("b")),
+            ("b", 2, Some("a"), Some("c")),
+            ("c", 3, Some("b"), None),
+        ] {
+            let place = snapshot.item_place(item).unwrap();
+            assert_eq!((place.number(), place.count()), (number, 3), "{item}");
+            assert_eq!(id(place.previous), previous, "{item}");
+            assert_eq!(id(place.next), next, "{item}");
+        }
+        assert!(snapshot.item_place("shared").is_none());
     }
 
     #[tokio::test]

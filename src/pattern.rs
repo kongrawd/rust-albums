@@ -47,6 +47,15 @@ impl Pattern {
         Ok(Self { segments })
     }
 
+    /// The placeholders of the folder segments, in the pattern's order: those
+    /// whose values become album metadata.
+    pub fn album_placeholders(&self) -> impl Iterator<Item = &str> {
+        let folders = &self.segments[..self.segments.len() - 1];
+        folders
+            .iter()
+            .flat_map(|segment| segment.placeholders.iter().map(String::as_str))
+    }
+
     /// Number of path segments (folders + file) a matching file has below the root.
     pub fn depth(&self) -> usize {
         self.segments.len()

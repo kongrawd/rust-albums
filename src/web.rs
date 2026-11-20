@@ -6,7 +6,7 @@ use crate::{AppState, access_log, html, library, routes, session};
 use axum::{
     Extension, Form, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header},
     middleware,
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -204,8 +204,11 @@ async fn sign_out(State(state): State<AppState>, headers: HeaderMap) -> Response
     (headers, Redirect::to(routes::SIGN_IN)).into_response()
 }
 
-async fn list_albums(State(state): State<AppState>) -> Markup {
-    html::album_list(&state.library.snapshot())
+/// The album list, sorted as its URL asks (see [`routes::album_sort`]).
+async fn list_albums(State(state): State<AppState>, uri: Uri) -> Markup {
+    let keys = state.library.sort_keys();
+    let sort = routes::album_sort(uri.query(), keys);
+    html::album_list(&state.library.snapshot(), keys, &sort)
 }
 
 async fn show_album(
@@ -223,8 +226,8 @@ async fn show_item(
     Path(item_id): Path<String>,
 ) -> Result<Markup, StatusCode> {
     let snapshot = state.library.snapshot();
-    let (album, item) = snapshot.item(&item_id).ok_or(StatusCode::NOT_FOUND)?;
-    Ok(html::item_page(&snapshot, album, item))
+    let place = snapshot.item_place(&item_id).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(html::item_page(&snapshot, &place))
 }
 
 /// 200 while storage is available, else 503 with a generic reason (this route
@@ -715,11 +718,13 @@ mod tests {
         let cookie = session_cookie(&app).await;
         let html = body_text(send(&app, open(&links.album, Some(&cookie))).await).await;
         let photo = format!(
-            r#"<a class="tile" href="{}" title="a.svg"><img loading="lazy" src="{}" alt=""><span class="caption">a.svg</span></a>"#,
-            links.photo_page, links.photo
+            r#"<a class="tile" id="{}" href="{}" title="a.svg"><img loading="lazy" src="{}" alt=""><span class="caption">a.svg</span></a>"#,
+            links.ids.item("Trip/a.svg"),
+            links.photo_page,
+            links.photo
         );
         let video = format!(
-            r#"<a class="tile" href="{}" title="b.mp4"><img loading="lazy" src="{}" alt=""><span class="play" aria-hidden="true">▶{}</span><span class="caption">b.mp4</span></a>"#,
+            r#"<a class="tile" id="{video_id}" href="{}" title="b.mp4"><img loading="lazy" src="{}" alt=""><span class="play" aria-hidden="true">▶{}</span><span class="caption">b.mp4</span></a>"#,
             links.video_page,
             routes::thumbnail_url(&video_id),
             '\u{FE0E}'
@@ -743,12 +748,12 @@ mod tests {
         let name = "001_a&amp;b &quot;x&quot; &lt;y&gt;.jpg";
         let tiles = [
             format!(
-                r#"<a class="tile" href="{}" title="{name} · seq: 001"><img loading="lazy" src="{}" alt=""><span class="caption">{name}</span></a>"#,
+                r#"<a class="tile" id="{photo_id}" href="{}" title="{name} · seq: 001"><img loading="lazy" src="{}" alt=""><span class="caption">{name}</span></a>"#,
                 routes::item_page_url(&photo_id),
                 routes::original_url(&photo_id)
             ),
             format!(
-                r#"<a class="tile" href="{}" title="002_clip.mp4 · seq: 002"><img loading="lazy" src="{}" alt=""><span class="play" aria-hidden="true">▶{}</span><span class="caption">002_clip.mp4</span></a>"#,
+                r#"<a class="tile" id="{video_id}" href="{}" title="002_clip.mp4 · seq: 002"><img loading="lazy" src="{}" alt=""><span class="play" aria-hidden="true">▶{}</span><span class="caption">002_clip.mp4</span></a>"#,
                 routes::item_page_url(&video_id),
                 routes::thumbnail_url(&video_id),
                 '\u{FE0E}'
@@ -761,10 +766,99 @@ mod tests {
         let page = routes::item_page_url(&photo_id).to_string();
         let html = body_text(send(&app, open(&page, Some(&cookie))).await).await;
         for shown in [
-            format!(r#"<p class="name">{name}</p>"#),
+            format!(r#"<h2 class="name">{name}</h2>"#),
             r#"<div class="chips"><span class="chip">seq: 001</span></div>"#.to_string(),
         ] {
             assert!(html.contains(&shown), "{shown}\n{html}");
+        }
+    }
+
+    /// The album list sorts as its URL asks: by folder (the default), name or a
+    /// folder placeholder, either way; ties keep folder order, and anything it
+    /// doesn't know or can't decode sorts by folder. (By creation: in the library's tests,
+    /// which control when files are written.)
+    #[tokio::test]
+    async fn the_album_list_sorts_as_asked() {
+        let files = [
+            ("2024/Zoo/a.svg", &b"x"[..]),
+            ("2023/Lake/a.svg", &b"x"[..]),
+            ("2023/Lake/b.svg", &b"x"[..]),
+            ("2025/attic/a.svg", &b"x"[..]),
+            ("2025/attic/b.svg", &b"x"[..]),
+            ("2025/attic/c.svg", &b"x"[..]),
+        ];
+        let (_dir, app, _ids, _log) = app_over("{year}/{album_name}/{file_name}", &files).await;
+        let cookie = session_cookie(&app).await;
+        for (query, expected) in [
+            ("", ["Lake", "Zoo", "attic"]),
+            ("?sort=folder&order=desc", ["attic", "Zoo", "Lake"]),
+            ("?sort=name", ["attic", "Lake", "Zoo"]),
+            ("?sort=name&order=desc", ["Zoo", "Lake", "attic"]),
+            ("?sort=year&order=desc", ["attic", "Zoo", "Lake"]),
+            // Number of items is no sort key.
+            ("?sort=items&order=desc", ["Lake", "Zoo", "attic"]),
+            ("?sort=album_name&order=up", ["Lake", "Zoo", "attic"]),
+            ("?sort=nothing", ["Lake", "Zoo", "attic"]),
+            // The first sort counts; one that doesn't decode is unknown.
+            ("?sort=name&sort=year&order=desc", ["Zoo", "Lake", "attic"]),
+            ("?sort=%FF&order=desc", ["Lake", "Zoo", "attic"]),
+        ] {
+            let url = format!("{}{query}", routes::HOME);
+            let html = body_text(send(&app, open(&url, Some(&cookie))).await).await;
+            let at = |name: &str| html.find(&format!("<h2>{name}</h2>")).unwrap();
+            let shown: Vec<_> = expected.iter().map(|name| at(name)).collect();
+            assert!(shown.is_sorted(), "{query}: {expected:?}\n{html}");
+        }
+    }
+
+    /// The album list links to each sort it offers: the current one marked, to
+    /// be reversed by following it again, with its direction said in words
+    /// too; the others ascending. Only keys and directions reach the URL.
+    #[tokio::test]
+    async fn the_album_list_links_to_its_sorts() {
+        let files = [
+            ("2024/Zoo/a.svg", &b"x"[..]),
+            ("2023/Lake/a.svg", &b"x"[..]),
+        ];
+        let (_dir, app, _ids, _log) = app_over("{year}/{album_name}/{file_name}", &files).await;
+        let cookie = session_cookie(&app).await;
+        let link = |key: &str| format!(r#"<a href="/?sort={key}">"#);
+        let current = |key: &str, href: &str, direction: &str, arrow: &str| {
+            format!(
+                r#"<a href="{href}" aria-current="true" aria-label="{key}, {direction}">{key} {arrow}</a>"#
+            )
+        };
+        for (query, shown) in [
+            (
+                "",
+                vec![
+                    r#"<nav class="sort" aria-label="Sort albums">"#.to_string(),
+                    current("folder", "/?sort=folder&amp;order=desc", "ascending", "↑"),
+                    link("name"),
+                    link("year"),
+                    link("created"),
+                ],
+            ),
+            (
+                "?sort=year",
+                vec![
+                    link("folder"),
+                    current("year", "/?sort=year&amp;order=desc", "ascending", "↑"),
+                ],
+            ),
+            (
+                "?sort=year&order=desc",
+                vec![current("year", "/?sort=year", "descending", "↓")],
+            ),
+        ] {
+            let url = format!("{}{query}", routes::HOME);
+            let html = body_text(send(&app, open(&url, Some(&cookie))).await).await;
+            for part in shown {
+                assert!(html.contains(&part), "{query}: {part}\n{html}");
+            }
+            // Neither `{album_name}` (name covers it) nor any value is a key.
+            let keys = ["sort=album_name", "sort=2024", "sort=Zoo"];
+            assert!(keys.iter().all(|key| !html.contains(key)), "{html}");
         }
     }
 
@@ -1382,24 +1476,34 @@ mod tests {
         let cookie = session_cookie(&app).await;
         let album = body_text(send(&app, open(&links.album, Some(&cookie))).await).await;
         for page in [&links.photo_page, &links.video_page] {
-            let tile = format!(r#"<a class="tile" href="{page}""#);
+            let tile = format!(r#"href="{page}" title="#);
             assert!(album.contains(&tile), "{album}");
         }
         assert!(!album.contains("target="), "{album}");
 
+        // Where thumbnails are made, the video shows its own until it plays.
+        let video_thumbnail = if cfg!(any(target_os = "linux", target_os = "macos")) {
+            let id = links.ids.item("Trip/b.mp4");
+            format!(r#" poster="{}""#, routes::thumbnail_url(&id))
+        } else {
+            String::new()
+        };
         for (page, title, media, original) in [
             (
                 &links.photo_page,
                 "Photo",
-                format!(r#"<img src="{}" alt="a.svg">"#, links.photo),
+                format!(
+                    r#"<img src="{}" alt="a.svg" fetchpriority="high">"#,
+                    links.photo
+                ),
                 &links.photo,
             ),
             (
                 &links.video_page,
                 "Video",
                 format!(
-                    r#"<video controls playsinline preload="metadata"><source src="{}">"#,
-                    links.video
+                    r#"<video controls playsinline preload="metadata"{}><source src="{}"></video>"#,
+                    video_thumbnail, links.video
                 ),
                 &links.video,
             ),
@@ -1416,11 +1520,179 @@ mod tests {
             let html = body_text(response).await;
             assert!(html.contains(&format!("<h1>{title}</h1>")), "{html}");
             assert!(html.contains(&media), "{html}");
-            let back = format!(r#"<a href="{}">← Trip</a>"#, links.album);
-            assert!(html.contains(&back), "{html}");
+            let back = format!(r#"<a href="{}#"#, links.album);
+            assert!(
+                html.contains(&back) && html.contains("← Trip</a>"),
+                "{html}"
+            );
             let open_original =
                 format!(r#"<a href="{original}" target="_blank">Open original</a>"#);
             assert!(html.contains(&open_original), "{html}");
+        }
+    }
+
+    /// A video's page shows its thumbnail until it plays, where it has one
+    /// (iOS shows no frame before that); a WebM video has none.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn video_pages_show_their_thumbnail_until_played() {
+        let (_dir, app, links, _log) = app_with_files(&["Trip/c.webm"]).await;
+        let cookie = session_cookie(&app).await;
+        let html = body_text(send(&app, open(&links.video_page, Some(&cookie))).await).await;
+        let thumbnail = routes::thumbnail_url(&links.ids.item("Trip/b.mp4")).to_string();
+        let video =
+            format!(r#"<video controls playsinline preload="metadata" poster="{thumbnail}">"#);
+        assert!(html.contains(&video), "{video}\n{html}");
+        let webm = routes::item_page_url(&links.ids.item("Trip/c.webm")).to_string();
+        let html = body_text(send(&app, open(&webm, Some(&cookie))).await).await;
+        assert!(
+            html.contains("<video ") && !html.contains("poster="),
+            "{html}"
+        );
+    }
+
+    /// A photo's page fetches it first, and the next item's picture straight
+    /// away, so that page shows its photo at once; the previous one, likely just
+    /// seen, loads as the pager nears the screen.
+    #[tokio::test]
+    async fn item_pages_load_the_photo_first_and_the_next_picture_early() {
+        let (_dir, app, links, _log) = app_with_files(&["Trip/c.svg"]).await;
+        let cookie = session_cookie(&app).await;
+        let html = body_text(send(&app, open(&links.photo_page, Some(&cookie))).await).await;
+        let photo = format!(
+            r#"<img src="{}" alt="a.svg" fetchpriority="high">"#,
+            links.photo
+        );
+        assert!(html.contains(&photo), "{photo}\n{html}");
+        let c = links.ids.item("Trip/c.svg");
+        let html = body_text(send(&app, open(&links.video_page, Some(&cookie))).await).await;
+        for link in [
+            format!(
+                r#"<a rel="prev" href="{}"><img loading="lazy" src="{}" alt="">"#,
+                links.photo_page, links.photo
+            ),
+            format!(
+                r#"<a rel="next" href="{}"><img src="{}" alt="">"#,
+                routes::item_page_url(&c),
+                routes::original_url(&c)
+            ),
+        ] {
+            assert!(html.contains(&link), "{link}\n{html}");
+        }
+    }
+
+    /// An item page shows the item first, then its name, metadata and link to
+    /// the original, and its previous and next at the very bottom.
+    #[tokio::test]
+    async fn item_pages_show_the_item_above_its_name_and_pager() {
+        let (_dir, app, links) = app().await;
+        let cookie = session_cookie(&app).await;
+        let html = body_text(send(&app, open(&links.photo_page, Some(&cookie))).await).await;
+        let at = |part: &str| html.find(part).unwrap_or_else(|| panic!("{part}\n{html}"));
+        let (media, name) = (at(r#"<div class="view">"#), at(r#"<h2 class="name">"#));
+        let (original, pager) = (at(">Open original<"), at(r#"<nav class="pager""#));
+        assert!(
+            media < name && name < original && original < pager,
+            "{html}"
+        );
+        // The page's content, pager last, fills the screen below the header.
+        assert!(html.contains(r#"</header><main class="item">"#), "{html}");
+        assert!(html.ends_with("</nav></main></body></html>"), "{html}");
+        // Other pages' content is in `main` too, without the item page's layout.
+        let album = body_text(send(&app, open(&links.album, Some(&cookie))).await).await;
+        assert!(album.contains("</header><main>"), "{album}");
+    }
+
+    /// An item page links to the items before and after it in its album, and
+    /// says where it is; the first has no previous, the last no next.
+    #[tokio::test]
+    async fn item_pages_link_to_the_items_before_and_after() {
+        let (_dir, app, links, _log) = app_with_files(&["Trip/c.mp4"]).await;
+        let cookie = session_cookie(&app).await;
+        let last = routes::item_page_url(&links.ids.item("Trip/c.mp4")).to_string();
+        for (page, position, previous, next) in [
+            (&links.photo_page, "1 of 3", None, Some(&links.video_page)),
+            (
+                &links.video_page,
+                "2 of 3",
+                Some(&links.photo_page),
+                Some(&last),
+            ),
+            (&last, "3 of 3", Some(&links.video_page), None),
+        ] {
+            let html = body_text(send(&app, open(page, Some(&cookie))).await).await;
+            assert!(html.contains(&format!(">{position}<")), "{page}\n{html}");
+            for (rel, target) in [("prev", previous), ("next", next)] {
+                match target {
+                    Some(href) => {
+                        let link = format!(r#"<a rel="{rel}" href="{href}">"#);
+                        assert!(html.contains(&link), "{link}\n{html}");
+                    }
+                    None => assert!(!html.contains(&format!(r#"rel="{rel}""#)), "{html}"),
+                }
+            }
+        }
+    }
+
+    /// An item page's way back to its album lands on the item's tile, found by
+    /// link id, so a name never reaches the URL.
+    #[tokio::test]
+    async fn item_pages_lead_back_to_their_tile() {
+        let (_dir, app, links) = app().await;
+        let cookie = session_cookie(&app).await;
+        let id = links.ids.item("Trip/b.mp4");
+        let html = body_text(send(&app, open(&links.video_page, Some(&cookie))).await).await;
+        let back = format!(r#"<a href="{}#{id}">← Trip</a>"#, links.album);
+        assert!(html.contains(&back), "{back}\n{html}");
+        let html = body_text(send(&app, open(&links.album, Some(&cookie))).await).await;
+        let tile = format!(r#"<a class="tile" id="{id}" href="{}""#, links.video_page);
+        assert!(html.contains(&tile), "{tile}\n{html}");
+    }
+
+    /// Two files in one folder whose names differ only in Unicode form, which
+    /// Linux allows, share a link id: the scan refuses both, so their album
+    /// shows neither, numbers the rest from 1 and has no tile leading nowhere.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn albums_show_no_tile_for_files_sharing_a_link_id() {
+        let files = [
+            ("Lake/Caf\u{e9}.svg", &b"x"[..]),
+            ("Lake/Cafe\u{301}.svg", &b"x"[..]),
+            ("Lake/dock.svg", &b"x"[..]),
+        ];
+        let (_dir, app, ids, _log) = app_over("{album_name}/{file_name}", &files).await;
+        let cookie = session_cookie(&app).await;
+        let album = routes::album_url(&ids.album("Lake")).to_string();
+        let html = body_text(send(&app, open(&album, Some(&cookie))).await).await;
+        assert_eq!(html.matches(r#"<a class="tile""#).count(), 1, "{html}");
+        assert!(html.contains("dock.svg") && !html.contains("Caf"), "{html}");
+        let dock = routes::item_page_url(&ids.item("Lake/dock.svg")).to_string();
+        let html = body_text(send(&app, open(&dock, Some(&cookie))).await).await;
+        assert!(
+            html.contains(">1 of 1<") && !html.contains(r#"rel=""#),
+            "{html}"
+        );
+    }
+
+    /// The album list and an album's grid are lists, so screen readers say how
+    /// many albums or items they hold. (Names as headings: the tests of what
+    /// each page shows.)
+    #[tokio::test]
+    async fn album_and_item_grids_are_lists() {
+        let (_dir, app, links) = app().await;
+        let cookie = session_cookie(&app).await;
+        for (page, list) in [
+            (
+                routes::HOME,
+                r#"<ul class="albums" role="list"><li><a class="album""#,
+            ),
+            (
+                &links.album,
+                r#"<ul class="items" role="list"><li><a class="tile""#,
+            ),
+        ] {
+            let html = body_text(send(&app, open(page, Some(&cookie))).await).await;
+            assert!(html.contains(list), "{list}\n{html}");
         }
     }
 
@@ -1436,7 +1708,7 @@ mod tests {
             let response = send(&app, open(&page, Some(&cookie))).await;
             assert_eq!(response.status(), StatusCode::OK, "{page}");
             let html = body_text(response).await;
-            let shown = format!(r#"<p class="name">{name}</p>"#);
+            let shown = format!(r#"<h2 class="name">{name}</h2>"#);
             assert!(html.contains(&shown), "{html}");
         }
         let photo_id = links.photo.trim_start_matches("/media/");
