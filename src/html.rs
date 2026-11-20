@@ -49,6 +49,14 @@ const FILE_NAME_PLACEHOLDER: &str = "file_name";
 /// in that stage, so its own size can't change the stage's while it loads, and
 /// `scale-down` fits it inside without ever enlarging it. Short screens,
 /// zoomed ones included, get a smaller heading.
+///
+/// In forced colors (Windows' high contrast), where the browser picks every
+/// color and drops backgrounds that are images: text dimmed with `opacity`
+/// gets full strength, as forced colors leave opacity alone, and tiles,
+/// covers and the pager's pictures get an outline in the text's color, so a
+/// square without a picture, once only a background, still shows. Pages fade
+/// into one another where browsers can (`@view-transition`, ignored
+/// elsewhere), unless the user asks for less motion.
 const STYLE: &str = "
 html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
 body{box-sizing:border-box;min-height:100vh;min-height:100svh;display:flex;flex-direction:column;font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Noto Sans',sans-serif,'Apple Color Emoji','Segoe UI Emoji','Noto Color Emoji';margin:0 auto;max-width:1400px;padding:1rem;overflow-wrap:anywhere}
@@ -81,6 +89,8 @@ a{color:inherit}button,input{font:inherit}img{display:block}
 .view img,.view video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:scale-down}
 @media(max-height:32rem){body{padding-top:.5rem;padding-bottom:.5rem}.top h1{font-size:1.25rem;margin:0}.view{margin:.25rem 0}}
 @media(prefers-color-scheme:dark){.error{color:#ff8a80}}
+@media(forced-colors:active){.muted,.place,.play{opacity:1}.tile,.cover,.pager img{outline:1px solid CanvasText;outline-offset:-1px}}
+@media(prefers-reduced-motion:no-preference){@view-transition{navigation:auto}}
 ";
 
 /// The sign-in page. `message` explains a failed attempt; `next` is where to
